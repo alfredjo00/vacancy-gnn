@@ -1,0 +1,10 @@
+# Dataset configuration (see PLAN.md Section 5).
+family: FeMnAl            # single spinel family for the deep, scoped study
+dataset_path: data/full/arrangements.parquet
+structures_path: data/full/structures.extxyz
+sample_path: data/sample/arrangements.parquet
+split:
+  scheme: composition     # no composition leakage across train/val/test
+  val_fraction: 0.15
+  test_fraction: 0.15
+  seed: 0

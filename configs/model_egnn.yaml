@@ -1,0 +1,6 @@
+# Equivariant GNN (centerpiece). See PLAN.md Section 6.
+name: egnn
+cutoff: 5.0              # Angstrom, edge distance cutoff
+hidden_channels: 64
+num_layers: 3
+max_l: 1                # max rotation order for equivariant features

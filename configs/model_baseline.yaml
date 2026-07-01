@@ -1,0 +1,5 @@
+# Cluster-expansion-style baseline. See PLAN.md Section 6.
+name: baseline
+kind: linear            # linear | mlp
+shell_cutoff: 3.5       # Angstrom, coordination shell for local descriptors
+regularization: 1.0e-3

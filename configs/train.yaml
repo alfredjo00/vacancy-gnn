@@ -1,0 +1,10 @@
+# Training configuration. See PLAN.md Section 8.
+seed: 0
+epochs: 200
+batch_size: 64
+learning_rate: 1.0e-3
+optimizer: adam
+tracking:
+  backend: none          # none | wandb | mlflow  (decide before scale training)
+  project: vacancy-gnn
+checkpoint_dir: checkpoints
