@@ -36,6 +36,6 @@ data/full/
 .idea/
 .DS_Store
 
-# Local Claude Code config and personal safety guardrail (not for the public repo)
+# Local Claude Code config (personal, not for the public repo)
 .claude/settings.local.json
-.claude/hooks/
+.claude/
