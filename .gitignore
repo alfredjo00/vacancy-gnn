@@ -35,3 +35,7 @@ data/full/
 .vscode/
 .idea/
 .DS_Store
+
+# Local Claude Code config and personal safety guardrail (not for the public repo)
+.claude/settings.local.json
+.claude/hooks/
