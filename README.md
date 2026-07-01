@@ -38,9 +38,14 @@ converged `G(v)`.
 
 In progress. Implemented and tested: the pure thermodynamics core
 (`vacancy_gnn.physics`), the data layer (schema, featurization, composition-aware
-splits), the cluster-expansion linear baseline, and a model-agnostic training loop
-with experiment tracking and checkpointing. The equivariant GNN and the evaluation
-harness land next per the build order in [`PLAN.md`](PLAN.md).
+splits), the cluster-expansion linear baseline, a model-agnostic training loop with
+experiment tracking and checkpointing, and a dependency-light E(3)-equivariant GNN
+(the centerpiece). The evaluation harness and brute-force reference land next per
+the build order in [`PLAN.md`](PLAN.md).
+
+The GNN needs the optional `ml` extra (`pip install -e ".[ml]"`, which pulls in
+torch); the rest of the package installs and runs without it, so CI stays green
+both with and without torch.
 
 ## Quickstart
 

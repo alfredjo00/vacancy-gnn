@@ -73,6 +73,14 @@ warn_unused_configs = true
 module = ["torch.*", "pandas.*", "matplotlib.*", "pyarrow.*"]
 ignore_missing_imports = true
 
+# egnn.py subclasses torch.nn.Module. When torch is not installed (the core CI
+# job), its stubs are absent and mypy reports spurious subclass-Any / unused-ignore
+# errors. These codes do not fire when torch IS installed (the test-ml CI job type-
+# checks this module for real), so suppressing them here only removes no-torch noise.
+[[tool.mypy.overrides]]
+module = ["vacancy_gnn.models.egnn"]
+disable_error_code = ["misc", "no-any-return", "unused-ignore"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --cov=vacancy_gnn --cov-report=term-missing"
