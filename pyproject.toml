@@ -60,6 +60,10 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.per-file-ignores]
+# typer uses function-call defaults (typer.Option/Argument) by design.
+"src/vacancy_gnn/cli.py" = ["B008"]
+
 [tool.mypy]
 strict = true
 files = ["src"]

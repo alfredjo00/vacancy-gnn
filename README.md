@@ -36,9 +36,11 @@ converged `G(v)`.
 
 ## Status
 
-Early scaffold. The pure thermodynamics core (`vacancy_gnn.physics`) and the CLI
-are implemented and tested; the dataset, models, and evaluation harness land next
-per the build order in [`PLAN.md`](PLAN.md).
+In progress. Implemented and tested: the pure thermodynamics core
+(`vacancy_gnn.physics`), the data layer (schema, featurization, composition-aware
+splits), the cluster-expansion linear baseline, and a model-agnostic training loop
+with experiment tracking and checkpointing. The equivariant GNN and the evaluation
+harness land next per the build order in [`PLAN.md`](PLAN.md).
 
 ## Quickstart
 
@@ -50,6 +52,9 @@ pytest
 vacancy-gnn gibbs -e -4.0,-2.0,1.0 --temperature 1323
 # At T -> 0 it reduces to the lowest arrangement:
 vacancy-gnn gibbs -e -4.0,-2.0,1.0 --temperature 0
+
+# Train the linear baseline end-to-end (synthetic data until the factory export):
+vacancy-gnn train --checkpoint-dir checkpoints
 ```
 
 ## Development
