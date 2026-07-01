@@ -22,6 +22,12 @@ def test_gibbs_zero_temperature_reports_minimum() -> None:
     assert result.stdout.strip() == "-5.000000"
 
 
-def test_unimplemented_command_exits_nonzero() -> None:
-    result = runner.invoke(app, ["train"])
+def test_train_runs_end_to_end(tmp_path: object) -> None:
+    result = runner.invoke(app, ["train", "--seed", "0"])
+    assert result.exit_code == 0
+    assert "val MAE" in result.stdout
+
+
+def test_evaluate_still_stubbed() -> None:
+    result = runner.invoke(app, ["evaluate"])
     assert result.exit_code == 1

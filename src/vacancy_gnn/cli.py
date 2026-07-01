@@ -8,10 +8,15 @@ because it only depends on the pure physics core.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from vacancy_gnn import __version__
+from vacancy_gnn.data.synthetic import make_synthetic_dataset
+from vacancy_gnn.models import LinearBaseline
 from vacancy_gnn.physics import free_energy
+from vacancy_gnn.train import train as run_training
 
 app = typer.Typer(
     name="vacancy-gnn",
@@ -46,9 +51,36 @@ def gibbs(
 
 
 @app.command()
-def train() -> None:
-    """Train a model (stub; implemented in PLAN.md step 4/5)."""
-    raise typer.Exit(_not_yet("train"))
+def train(
+    regularization: float = typer.Option(
+        1e-3, "--reg", help="Ridge penalty for the linear baseline."
+    ),
+    cutoff: float = typer.Option(5.0, "--cutoff", help="Edge distance cutoff."),
+    seed: int = typer.Option(0, "--seed", help="Random seed."),
+    checkpoint_dir: Path | None = typer.Option(
+        None, "--checkpoint-dir", help="Directory to save the fitted model."
+    ),
+) -> None:
+    """Train the linear baseline on a synthetic dataset (real end-to-end run).
+
+    Uses synthetic data until the factory export lands (PLAN.md step 4); the GNN
+    plugs into the same loop later.
+    """
+    dataset = make_synthetic_dataset(seed=seed)
+    model = LinearBaseline(regularization=regularization)
+    result = run_training(
+        model,
+        dataset,
+        cutoff=cutoff,
+        checkpoint_dir=checkpoint_dir,
+        seed=seed,
+    )
+    typer.echo(
+        f"val MAE={result.val_mae:.4f} eV  val RMSE={result.val_rmse:.4f} eV  "
+        f"(train={result.n_train}, val={result.n_val})"
+    )
+    if result.checkpoint is not None:
+        typer.echo(f"saved checkpoint -> {result.checkpoint}")
 
 
 @app.command()
