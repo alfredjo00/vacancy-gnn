@@ -19,9 +19,29 @@ from numpy.typing import NDArray
 
 from vacancy_gnn.data.featurize import Graph
 
-#: Cation atomic numbers the descriptor is defined over (the FeMnAl family plus
-#: common spinel B-site cations). Fixed so descriptor length is constant.
-DESCRIPTOR_SPECIES: tuple[int, ...] = (3, 12, 13, 22, 23, 24, 25, 26, 27, 28, 29, 30)
+#: Cation atomic numbers the descriptor is defined over: the union of A-site and
+#: B-site spinel elements from the offline factory's element pools (PLAN.md
+#: Section 5), i.e. Li, Mg, Al, Ca, Ti, V, Cr, Mn, Fe, Co, Ni, Cu, Zn, Ga, Zr, In,
+#: Sn. Fixed so descriptor length is constant.
+DESCRIPTOR_SPECIES: tuple[int, ...] = (
+    3,
+    12,
+    13,
+    20,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    40,
+    49,
+    50,
+)
 
 
 def descriptor_length() -> int:
