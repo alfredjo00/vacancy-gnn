@@ -34,18 +34,29 @@ converged `G(v)`.
 > configurational entropy is not negligible and taking the minimum biases rankings.
 > See [`PLAN.md`](PLAN.md) Section 2.1.
 
+![Noisy single-SQS G(v) vs. the learned Boltzmann average](notebooks/money_figure.png)
+
+Single-SQS draws (red) scatter widely around the brute-force truth (dashed); the
+learned Boltzmann average (blue) tightens as more arrangements are scored. See
+[`notebooks/01_money_figure.ipynb`](notebooks/01_money_figure.ipynb) for the full,
+reproducible walkthrough, including why the gap to truth reflects the current
+synthetic-data baseline's fit quality, not the averaging method.
+
 ## Status
 
 In progress. Implemented and tested: the pure thermodynamics core
 (`vacancy_gnn.physics`), the data layer (schema, featurization, composition-aware
 splits), the cluster-expansion linear baseline, a model-agnostic training loop with
-experiment tracking and checkpointing, and a dependency-light E(3)-equivariant GNN
-(the centerpiece). The evaluation harness and brute-force reference land next per
+experiment tracking and checkpointing, a dependency-light E(3)-equivariant GNN (the
+centerpiece), and the evaluation harness (brute-force reference, parity/convergence
+metrics, oracle-efficiency, min-vs-average divergence, T-sweep, and the money
+figure). The offline CHGNet factory export and full-scale retraining land next per
 the build order in [`PLAN.md`](PLAN.md).
 
 The GNN needs the optional `ml` extra (`pip install -e ".[ml]"`, which pulls in
 torch); the rest of the package installs and runs without it, so CI stays green
-both with and without torch.
+both with and without torch. Reproducing the money figure notebook needs the
+`viz` extra (`pip install -e ".[viz]"`, matplotlib) plus Jupyter.
 
 ## Quickstart
 
@@ -60,6 +71,12 @@ vacancy-gnn gibbs -e -4.0,-2.0,1.0 --temperature 0
 
 # Train the linear baseline end-to-end (synthetic data until the factory export):
 vacancy-gnn train --checkpoint-dir checkpoints
+
+# Evaluate against the brute-force reference (parity, min-vs-average divergence):
+vacancy-gnn evaluate
+
+# Predict the averaged G(v) for a composition and vacancy count:
+vacancy-gnn predict --composition FeMnAl-ref-000 --vacancies 2
 ```
 
 ## Development
