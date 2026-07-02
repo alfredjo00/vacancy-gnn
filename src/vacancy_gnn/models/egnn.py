@@ -8,9 +8,13 @@ optional ``[ml]`` extra (torch) added.
 Design (PaiNN-style, orders l=0 and l=1):
 - each node carries a scalar feature ``s`` (invariant) and a vector feature ``v``
   (equivariant, shape ``(3, F)``);
-- messages mix a radial function of the edge distance (invariant) with the edge
-  unit vector (equivariant), so scalar outputs are invariant and vector features
-  rotate with the structure;
+- a message block mixes a radial function of the edge distance (invariant) with
+  the edge unit vector (equivariant), so scalar outputs are invariant and vector
+  features rotate with the structure;
+- an update block then feeds the vector features back into the scalars via
+  rotation-invariant inner products, so the equivariant channel actually
+  influences the predicted energy (without it the vector features would be dead
+  weight and the model would collapse to a distance-only invariant network);
 - the readout sums a per-node scalar energy contribution, giving a total energy
   invariant to global rotation, translation, and node permutation.
 
@@ -29,17 +33,22 @@ from numpy.typing import NDArray
 from torch import Tensor, nn
 
 from vacancy_gnn.data.featurize import Graph
+from vacancy_gnn.models.reference import CompositionReference
 
 
 def _graph_to_tensors(
     graph: Graph, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Convert a numpy Graph into the tensors the network consumes."""
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Convert a numpy Graph into the tensors the network consumes.
+
+    Vacancy markers arrive as nodes with :data:`VACANCY_MARKER_Z` (0), so they
+    flow through the same embedding table as cations; no separate vacancy feature
+    is needed.
+    """
     z = torch.from_numpy(graph.node_z.astype(np.int64)).to(device)
-    vac = torch.from_numpy(graph.node_vacancy_count.astype(np.float32)).to(device)
     edge_index = torch.from_numpy(graph.edge_index.astype(np.int64)).to(device)
     edge_vec = torch.from_numpy(graph.edge_vec.astype(np.float32)).to(device)
-    return z, vac, edge_index, edge_vec
+    return z, edge_index, edge_vec
 
 
 class RadialBasis(nn.Module):
@@ -104,6 +113,39 @@ class EquivariantMessage(nn.Module):
         return s + agg_s, v + agg_v
 
 
+class EquivariantUpdate(nn.Module):
+    """PaiNN-style node update mixing vector features back into the scalars.
+
+    Two learned linear maps ``U`` and ``V`` act on the feature axis of the ``(3,
+    H)`` vector features. The scalar channel is then updated from the vector norm
+    ``||Vv||`` and the rotation-invariant inner product ``<Uv, Vv>``, which is
+    what lets the equivariant l=1 features influence an invariant energy. Vectors
+    are updated by a scalar-gated multiple of ``Uv`` (still equivariant).
+    """
+
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.hidden = hidden
+        self.u_proj = nn.Linear(hidden, hidden, bias=False)
+        self.v_proj = nn.Linear(hidden, hidden, bias=False)
+        self.scalar_mlp = nn.Sequential(
+            nn.Linear(3 * hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 2 * hidden),
+        )
+
+    def forward(self, s: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        uv = self.u_proj(v)  # (N, 3, H), equivariant
+        vv = self.v_proj(v)  # (N, 3, H), equivariant
+        vv_norm = torch.linalg.norm(vv, dim=1)  # (N, H), invariant
+        inner = (uv * vv).sum(dim=1)  # (N, H), <Uv, Vv> invariant
+
+        a = self.scalar_mlp(torch.cat([s, vv_norm, inner], dim=-1))
+        ds, dv_gate = torch.split(a, self.hidden, dim=-1)
+
+        return s + ds, v + dv_gate[:, None, :] * uv
+
+
 class _EGNNNet(nn.Module):
     """The torch module: embeddings, message layers, and a scalar energy readout."""
 
@@ -118,10 +160,12 @@ class _EGNNNet(nn.Module):
         super().__init__()
         self.hidden = hidden
         self.embedding = nn.Embedding(max_z, hidden)
-        self.vac_proj = nn.Linear(1, hidden)
         self.rbf = RadialBasis(num_basis, cutoff)
-        self.layers = nn.ModuleList(
+        self.messages = nn.ModuleList(
             EquivariantMessage(hidden, num_basis) for _ in range(num_layers)
+        )
+        self.updates = nn.ModuleList(
+            EquivariantUpdate(hidden) for _ in range(num_layers)
         )
         self.readout = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -129,16 +173,16 @@ class _EGNNNet(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-    def forward(
-        self, z: Tensor, vac: Tensor, edge_index: Tensor, edge_vec: Tensor
-    ) -> Tensor:
-        s = self.embedding(z) + self.vac_proj(vac[:, None])
+    def forward(self, z: Tensor, edge_index: Tensor, edge_vec: Tensor) -> Tensor:
+        s = self.embedding(z)
         v = torch.zeros(z.shape[0], 3, self.hidden, device=z.device)
         dist = torch.linalg.norm(edge_vec, dim=1)
         rbf = self.rbf(dist)
-        for layer in self.layers:
-            assert isinstance(layer, EquivariantMessage)
-            s, v = layer(s, v, edge_index, edge_vec, rbf)
+        for message, update in zip(self.messages, self.updates, strict=True):
+            assert isinstance(message, EquivariantMessage)
+            assert isinstance(update, EquivariantUpdate)
+            s, v = message(s, v, edge_index, edge_vec, rbf)
+            s, v = update(s, v)
         node_energy = self.readout(s).squeeze(-1)
         total: Tensor = node_energy.sum()
         return total
@@ -175,6 +219,7 @@ class EquivariantGNN:
         self._net: _EGNNNet | None = None
         self._target_mean: float = 0.0
         self._target_std: float = 1.0
+        self._reference: CompositionReference | None = None
 
     def _build_net(self) -> _EGNNNet:
         torch.manual_seed(int(self.config["seed"]))
@@ -192,9 +237,14 @@ class EquivariantGNN:
         if y.shape[0] != len(graphs):
             raise ValueError("number of energies must match number of graphs")
 
-        self._target_mean = float(y.mean())
-        self._target_std = float(y.std()) or 1.0
-        targets = (y - self._target_mean) / self._target_std
+        # Learn only the per-arrangement residual over a per-species reference.
+        self._reference = CompositionReference()
+        self._reference.fit(graphs, y)
+        residual = y - self._reference.predict(graphs)
+
+        self._target_mean = float(residual.mean())
+        self._target_std = float(residual.std()) or 1.0
+        targets = (residual - self._target_mean) / self._target_std
 
         self._net = self._build_net()
         opt = torch.optim.Adam(
@@ -212,17 +262,18 @@ class EquivariantGNN:
             opt.step()
 
     def predict(self, graphs: list[Graph]) -> NDArray[np.float64]:
-        if self._net is None:
+        if self._net is None or self._reference is None:
             raise RuntimeError("model is not fitted; call fit() first")
         self._net.eval()
         with torch.no_grad():
             tensors = [_graph_to_tensors(g, self.device) for g in graphs]
             preds = torch.stack([self._net(*t) for t in tensors]).cpu().numpy()
-        result: NDArray[np.float64] = preds * self._target_std + self._target_mean
+        residual = preds * self._target_std + self._target_mean
+        result: NDArray[np.float64] = residual + self._reference.predict(graphs)
         return result.astype(np.float64)
 
     def save(self, path: Path) -> None:
-        if self._net is None:
+        if self._net is None or self._reference is None:
             raise RuntimeError("model is not fitted; call fit() first")
         # Weights in a sibling .pt file; config/normalization in the json.
         weights_path = path.with_suffix(".pt")
@@ -231,6 +282,7 @@ class EquivariantGNN:
             "config": self.config,
             "target_mean": self._target_mean,
             "target_std": self._target_std,
+            "reference": self._reference.to_list(),
             "weights_file": weights_path.name,
         }
         path.write_text(json.dumps(payload))
@@ -241,6 +293,7 @@ class EquivariantGNN:
         model = cls(**payload["config"])
         model._target_mean = float(payload["target_mean"])
         model._target_std = float(payload["target_std"])
+        model._reference = CompositionReference.from_list(payload["reference"])
         model._net = model._build_net()
         weights_path = path.with_name(payload["weights_file"])
         model._net.load_state_dict(torch.load(weights_path, map_location=model.device))

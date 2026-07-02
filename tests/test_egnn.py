@@ -44,6 +44,19 @@ def _rotation(seed: int = 0) -> np.ndarray:
     return q
 
 
+def _transform(a: object, q: np.ndarray, shift: np.ndarray) -> object:
+    """Rotate+translate cations, oxygen sublattice, and cell together."""
+    return a.model_copy(  # type: ignore[attr-defined]
+        update={
+            "cation_positions": (a.positions_array() @ q.T + shift).tolist(),  # type: ignore[attr-defined]
+            "oxygen_positions": (
+                a.oxygen_positions_array() @ q.T + shift  # type: ignore[attr-defined]
+            ).tolist(),
+            "cell": (a.cell_array() @ q.T).tolist(),  # type: ignore[attr-defined]
+        }
+    )
+
+
 def test_egnn_satisfies_protocol() -> None:
     assert isinstance(_small_model(), EnergyModel)
 
@@ -63,14 +76,42 @@ def test_predicted_energy_invariant_under_rotation(
 
     q = _rotation(seed=2)
     shift = np.array([4.0, -1.0, 2.0])
-    a_rot = a.model_copy(
-        update={"cation_positions": (a.positions_array() @ q.T + shift).tolist()}
-    )
-    g_rot = build_graph(a_rot, cutoff=5.0)
+    g_rot = build_graph(_transform(a, q, shift), cutoff=5.0)
 
     e = model.predict([g])[0]
     e_rot = model.predict([g_rot])[0]
     assert e == pytest.approx(e_rot, abs=1e-4)
+
+
+def test_vector_channel_influences_energy(
+    make_arrangement: ArrangementFactory,
+) -> None:
+    # The equivariant vector channel must actually feed the energy (the PaiNN
+    # update block). Zeroing the vector features at every layer should change the
+    # prediction; if it did not, the l=1 pathway would be dead weight and the model
+    # a distance-only invariant net (the flaw this block fixes).
+    from vacancy_gnn.models.egnn import _graph_to_tensors
+
+    model = _small_model(epochs=30)
+    ds = make_synthetic_dataset(n_compositions=6, seed=11)
+    graphs = [build_graph(a, cutoff=5.0) for a in ds.arrangements]
+    energies = np.array([a.energy_ev for a in ds.arrangements])
+    model.fit(graphs, energies)
+    assert model._net is not None
+
+    a = make_arrangement("C", "FeMnAl", vacancy_sites=[0, 1], seed=6)
+    a = a.model_copy(update={"cation_species": [26, 25, 13, 27]})
+    tensors = _graph_to_tensors(build_graph(a, cutoff=5.0), model.device)
+
+    model._net.eval()
+    with torch.no_grad():
+        full = float(model._net(*tensors))
+        # Re-run with the vector features held at zero after every message layer.
+        for update in model._net.updates:
+            update.u_proj.weight.zero_()
+            update.v_proj.weight.zero_()
+        ablated = float(model._net(*tensors))
+    assert abs(full - ablated) > 1e-4
 
 
 def test_predicted_energy_invariant_under_permutation(

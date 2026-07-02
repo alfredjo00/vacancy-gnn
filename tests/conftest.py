@@ -27,6 +27,9 @@ OXYGEN_SITES = np.array(
     dtype=np.float64,
 )
 
+# Cubic cell large relative to the test cutoff, so edges rarely wrap.
+CELL = [[12.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 12.0]]
+
 
 def _make_arrangement(
     composition: str,
@@ -45,7 +48,9 @@ def _make_arrangement(
         v=len(vacancy_sites),
         cation_species=species,
         cation_positions=positions.tolist(),
+        oxygen_positions=OXYGEN_SITES.tolist(),
         vacancy_sites=vacancy_sites,
+        cell=CELL,
         energy_ev=float(rng.normal(-100.0, 1.0)),
         source_run="synthetic",
     )
