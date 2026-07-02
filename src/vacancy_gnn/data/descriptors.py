@@ -7,9 +7,12 @@ permutation-invariant quantities, so the baseline respects the same physical
 symmetry as the total energy (PLAN.md Section 6).
 
 The representation is a small, interpretable cluster-expansion-style descriptor:
-per-element counts, element-pair bond counts within the cutoff, and vacancy-count
-aggregates. It is deliberately transparent so the baseline is a meaningful, legible
-reference the GNN must beat.
+per-species counts, species-pair bond counts within the cutoff, and vacancy-node
+aggregates. Vacancy markers are treated as their own species, so cation-vacancy
+and vacancy-vacancy pair counts fall out of the same machinery, giving the
+baseline the same "which cation neighbors which vacancy" signal the GNN sees. It
+is deliberately transparent so the baseline is a meaningful, legible reference the
+GNN must beat.
 """
 
 from __future__ import annotations
@@ -17,13 +20,15 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from vacancy_gnn.data.featurize import Graph
+from vacancy_gnn.data.featurize import VACANCY_MARKER_Z, Graph
 
-#: Cation atomic numbers the descriptor is defined over: the union of A-site and
-#: B-site spinel elements from the offline factory's element pools (PLAN.md
-#: Section 5), i.e. Li, Mg, Al, Ca, Ti, V, Cr, Mn, Fe, Co, Ni, Cu, Zn, Ga, Zr, In,
-#: Sn. Fixed so descriptor length is constant.
+#: Species (atomic numbers) the descriptor is defined over: the vacancy marker
+#: (:data:`~vacancy_gnn.data.featurize.VACANCY_MARKER_Z`, i.e. 0) followed by the
+#: union of A-site and B-site spinel cations from the offline factory's element
+#: pools (PLAN.md Section 5): Li, Mg, Al, Ca, Ti, V, Cr, Mn, Fe, Co, Ni, Cu, Zn,
+#: Ga, Zr, In, Sn. Fixed so the descriptor length is constant.
 DESCRIPTOR_SPECIES: tuple[int, ...] = (
+    VACANCY_MARKER_Z,
     3,
     12,
     13,
@@ -47,9 +52,11 @@ DESCRIPTOR_SPECIES: tuple[int, ...] = (
 def descriptor_length() -> int:
     """Length of the descriptor vector produced by :func:`graph_descriptor`."""
     n = len(DESCRIPTOR_SPECIES)
-    n_pairs = n * (n + 1) // 2  # unordered element pairs, with self-pairs
-    # per-element counts + element-pair bond counts + 3 vacancy aggregates
-    return n + n_pairs + 3
+    n_pairs = n * (n + 1) // 2  # unordered species pairs, with self-pairs
+    # per-species counts + species-pair bond counts. The vacancy marker is one of
+    # the species, so its count is the vacancy total and its cross-pairs are the
+    # cation-vacancy / vacancy-vacancy adjacencies; no separate aggregate needed.
+    return n + n_pairs
 
 
 def _species_index() -> dict[int, int]:
@@ -72,7 +79,7 @@ def graph_descriptor(graph: Graph) -> NDArray[np.float64]:
     idx = _species_index()
     n_species = len(DESCRIPTOR_SPECIES)
 
-    # Per-element node counts.
+    # Per-species node counts (vacancy markers included).
     counts = np.zeros(n_species, dtype=np.float64)
     node_slot = np.empty(graph.n_nodes, dtype=np.int64)
     for node, z in enumerate(graph.node_z.tolist()):
@@ -81,7 +88,8 @@ def graph_descriptor(graph: Graph) -> NDArray[np.float64]:
         node_slot[node] = idx[z]
         counts[idx[z]] += 1.0
 
-    # Element-pair bond counts within the cutoff (undirected: halve directed edges).
+    # Species-pair bond counts within the cutoff (undirected: halve directed
+    # edges). Includes cation-vacancy and vacancy-vacancy pairs.
     pair_index = _pair_index_map(n_species)
     pair_counts = np.zeros(len(pair_index), dtype=np.float64)
     for e in range(graph.n_edges):
@@ -90,13 +98,7 @@ def graph_descriptor(graph: Graph) -> NDArray[np.float64]:
         key = (a, b) if a <= b else (b, a)
         pair_counts[pair_index[key]] += 0.5
 
-    # Vacancy aggregates: total, mean per node, max per node.
-    vac = graph.node_vacancy_count.astype(np.float64)
-    vac_aggr = np.array(
-        [vac.sum(), vac.mean() if vac.size else 0.0, vac.max() if vac.size else 0.0]
-    )
-
-    return np.concatenate([counts, pair_counts, vac_aggr])
+    return np.concatenate([counts, pair_counts])
 
 
 def _pair_index_map(n_species: int) -> dict[tuple[int, int], int]:

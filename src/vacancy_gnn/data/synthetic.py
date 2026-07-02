@@ -16,6 +16,16 @@ from vacancy_gnn.data.schema import Arrangement, Dataset
 
 _FAMILY_SPECIES: tuple[int, ...] = (26, 25, 13)  # Fe, Mn, Al
 
+# A cubic cell large relative to the cutoff so the synthetic point clouds are
+# featurized with well-defined (rarely wrapping) minimum-image edges.
+_CELL: list[list[float]] = [[12.0, 0.0, 0.0], [0.0, 12.0, 0.0], [0.0, 0.0, 12.0]]
+
+
+def _oxygen_sublattice(rng: np.random.Generator, n_sites: int) -> list[list[float]]:
+    """Random ideal oxygen sublattice inside the synthetic cell."""
+    sites: list[list[float]] = rng.uniform(-3.0, 3.0, size=(n_sites, 3)).tolist()
+    return sites
+
 
 def _reference_weight(weight_seed: int) -> np.ndarray:
     """The fixed random linear response over the descriptor that defines labels.
@@ -56,20 +66,26 @@ def make_synthetic_dataset(
 
     arrangements: list[Arrangement] = []
 
+    n_oxygen_sites = 8
     for c in range(n_compositions):
         species = rng.choice(_FAMILY_SPECIES, size=n_cations).tolist()
+        oxygen_positions = _oxygen_sublattice(rng, n_oxygen_sites)
         comp = f"FeMnAl-{c:03d}"
         for _ in range(arrangements_per_composition):
             positions = rng.uniform(-3.0, 3.0, size=(n_cations, 3))
             v = int(rng.integers(0, 4))
-            vacancy_sites = sorted(rng.choice(range(8), size=v, replace=False).tolist())
+            vacancy_sites = sorted(
+                rng.choice(n_oxygen_sites, size=v, replace=False).tolist()
+            )
             base = Arrangement(
                 composition=comp,
                 family="FeMnAl",
                 v=v,
                 cation_species=species,
                 cation_positions=positions.tolist(),
+                oxygen_positions=oxygen_positions,
                 vacancy_sites=vacancy_sites,
+                cell=_CELL,
                 energy_ev=0.0,  # placeholder; overwritten below
                 source_run="synthetic",
             )
@@ -125,6 +141,7 @@ def make_brute_force_reference(
     for c in range(n_compositions):
         species = rng.choice(_FAMILY_SPECIES, size=n_cations).tolist()
         positions = rng.uniform(-3.0, 3.0, size=(n_cations, 3))
+        oxygen_positions = _oxygen_sublattice(rng, n_oxygen_sites)
         comp = f"FeMnAl-ref-{c:03d}"
         for v in vacancy_levels:
             if v > n_oxygen_sites:
@@ -141,7 +158,9 @@ def make_brute_force_reference(
                     v=v,
                     cation_species=species,
                     cation_positions=positions.tolist(),
+                    oxygen_positions=oxygen_positions,
                     vacancy_sites=vacancy_sites,
+                    cell=_CELL,
                     energy_ev=0.0,  # placeholder; overwritten below
                     source_run="synthetic-brute-force",
                 )

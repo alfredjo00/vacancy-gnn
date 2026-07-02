@@ -11,20 +11,29 @@ The labeler is the MACE-MPA-0 universal MLIP foundation model (Matbench
 Discovery F1 ~0.85, vs. CHGNet's ~0.61), loaded via mace-torch's ASE calculator
 interface. No account/license gating is needed to download it (unlike some
 higher-ranked models such as eSEN-30M-OAM, which require accepting a Hugging
-Face license).
+Face license). Relaxation is BFGS on cell + ions to fmax=0.05 eV/A (see
+RELAX_FMAX).
 
-Placeholder scope (first factory run): a 3x2x1 supercell of the MgAl2O4 spinel
-prototype (prototypes.db, from Materials
-Project mp-3536), 84 atoms (12 A-site, 24 B-site, 48 O). Each composition
-fixes a random stoichiometry of 4-9 unique cation elements (drawn from the
-same A-site/B-site element pools as
-this script's element pools); each arrangement within
-that composition then independently shuffles the site occupancy (SQS-style)
-and draws a random vacancy set, so arrangements vary in both cation ordering
-and vacancy placement, not vacancy placement alone. Because this script
-builds the ideal lattice itself (rather than reading already-relaxed
-structures back from an existing run), vacancy_sites are exact indices into
-that lattice's oxygen sublattice, with no position-matching needed.
+Scope: a 3x2x1 supercell of the MgAl2O4 spinel prototype
+(prototypes.db, from Materials Project
+mp-3536), 84 atoms (12 A-site, 24 B-site, 48 O). Each composition fixes a random
+stoichiometry of 4-9 unique cation elements (drawn from the A-site/B-site element pools
+defined below); each
+arrangement within that composition then independently shuffles the site
+occupancy (SQS-style) and draws a random vacancy set, so arrangements vary in
+both cation ordering and vacancy placement.
+
+The run is bimodal (IMPROVEMENTS.md P1): many compositions with a few
+arrangements each (breadth, for held-out-composition generalization) plus a
+couple of compositions sampled densely (depth, so G(v) has a real brute-force
+reference per PLAN.md Section 7). The reference compositions come last and are
+distinct, so they can be held out of training cleanly.
+
+Records are self-contained: each carries ``cell`` and ``oxygen_positions`` (the
+ideal sublattice ``vacancy_sites`` index into), so vacancy_gnn can rebuild the
+full periodic geometry without this script's prototype db. Because the script
+builds the ideal lattice itself, vacancy_sites are exact indices with no
+position-matching needed.
 
 Not part of the installed package: needs ase, pymatgen, and mace-torch, none of
 which are runtime or `dev`/`ml` extras. Install them in a throwaway environment
@@ -33,10 +42,10 @@ to run this script, e.g.:
     pip install ase pymatgen mace-torch
 
 Usage:
-    python scripts/generate_factory_data.py --out data/full/factory_v1.json
+    python scripts/generate_factory_data.py --out data/full/factory_v2.json
 
 Writes partial results to ``out_path`` every 10 relaxations, so a crash or
-interrupt loses at most that much GPU work.
+interrupt loses at most that much GPU work; rerun with --resume to continue.
 """
 
 from __future__ import annotations
@@ -234,6 +243,15 @@ def build_arrangement_atoms(
     return ase.Atoms(numbers=numbers, positions=positions, cell=spec.cell, pbc=True)
 
 
+#: Force-convergence threshold (eV/A) for the geometry relaxation. MACE-MPA-0's
+#: own force error vs DFT is tens of meV/A and Matbench Discovery relaxes at 0.05,
+#: so converging tighter buys precision below the label-noise floor at several
+#: times the walltime. 0.05 keeps the energies well within noise while roughly
+#: tripling throughput (IMPROVEMENTS.md P2).
+RELAX_FMAX = 0.05
+SOURCE_RUN = "generate_factory_data.py-v2-mace-mpa-0-fmax0.05"
+
+
 def relax_energy_ev(atoms: object, calc: object) -> float:
     """Relax ``atoms`` with MACE-MPA-0 (BFGS, cell + ions) and return final energy."""
     from ase.filters import FrechetCellFilter
@@ -242,7 +260,7 @@ def relax_energy_ev(atoms: object, calc: object) -> float:
     atoms.calc = calc  # type: ignore[attr-defined]
     ecf = FrechetCellFilter(atoms)
     opt = BFGS(ecf, logfile=None)
-    opt.run(fmax=0.001, steps=1000)
+    opt.run(fmax=RELAX_FMAX, steps=1000)
     return float(atoms.get_potential_energy())  # type: ignore[attr-defined]
 
 
@@ -253,55 +271,93 @@ def _write_checkpoint(records: list[dict[str, object]], out_path: Path) -> None:
     tmp_path.replace(out_path)
 
 
+def _composition_plan(
+    n_train: int, train_per_level: int, n_reference: int, reference_per_level: int
+) -> list[tuple[int, int]]:
+    """Bimodal per-composition arrangement counts (IMPROVEMENTS.md P1).
+
+    Returns an ordered list of ``(composition_index, arrangements_per_level)``:
+    ``n_train`` compositions with ``train_per_level`` arrangements each (breadth,
+    for held-out-composition generalization), then ``n_reference`` compositions
+    with ``reference_per_level`` each (depth, so ``G(v)`` has a real brute-force
+    reference per PLAN.md Section 7). The reference compositions come last and are
+    distinct, so they can be held out of training cleanly.
+    """
+    plan = [(c, train_per_level) for c in range(n_train)]
+    plan += [(n_train + c, reference_per_level) for c in range(n_reference)]
+    return plan
+
+
 def generate(
-    n_compositions: int,
-    arrangements_per_level: int,
+    n_train: int,
+    train_per_level: int,
+    n_reference: int,
+    reference_per_level: int,
     seed: int,
     out_path: Path,
+    resume: bool,
 ) -> None:
     from mace.calculators import mace_mp
 
     rng = np.random.default_rng(seed)
+
+    records: list[dict[str, object]] = []
+    n_prior_done = 0
+    if resume and out_path.exists():
+        records = json.loads(out_path.read_text())["arrangements"]
+        n_prior_done = len(records)
+        print(f"resuming: {n_prior_done} arrangements already in {out_path}")
+
     calc = mace_mp(model="medium-mpa-0", device="cuda", default_dtype="float64")
 
+    plan = _composition_plan(n_train, train_per_level, n_reference, reference_per_level)
     n_oxygen_sites = None
-    records: list[dict[str, object]] = []
     t_start = time.time()
-    n_total = n_compositions * len(VACANCY_LEVELS) * arrangements_per_level
+    n_total = sum(count for _, count in plan) * len(VACANCY_LEVELS)
     n_done = 0
 
-    for c in range(n_compositions):
+    for c, per_level in plan:
         spec = build_composition(rng, c)
         if n_oxygen_sites is None:
             n_oxygen_sites = len(spec.oxygen_positions)
+        is_reference = c >= n_train
 
         for v in VACANCY_LEVELS:
-            for _ in range(arrangements_per_level):
+            for _ in range(per_level):
+                # Always draw, to keep the RNG stream identical to a fresh run;
+                # only skip the (expensive) relaxation itself when resuming
+                # past a prefix that a prior run already checkpointed.
                 cation_species = shuffle_cation_arrangement(rng, spec)
                 vacancy_sites = sorted(
                     rng.choice(n_oxygen_sites, size=v, replace=False).tolist()
                 )
+                n_done += 1
+                if n_done <= n_prior_done:
+                    continue
+
                 atoms = build_arrangement_atoms(spec, cation_species, vacancy_sites)
                 energy = relax_energy_ev(atoms, calc)
 
                 records.append(
                     {
                         "composition": spec.tag,
-                        "family": "HEO-spinel-factory-v1",
+                        "family": "HEO-spinel-factory-v2",
+                        "subset": "reference" if is_reference else "train",
                         "v": v,
                         "cation_species": cation_species,
                         "cation_positions": spec.cation_positions,
+                        "oxygen_positions": spec.oxygen_positions,
                         "vacancy_sites": vacancy_sites,
+                        "cell": spec.cell,
                         "energy_ev": energy,
-                        "source_run": "generate_factory_data.py-v1-mace-mpa-0",
+                        "source_run": SOURCE_RUN,
                     }
                 )
-                n_done += 1
                 if n_done % 10 == 0:
                     _write_checkpoint(records, out_path)
                 if n_done % 5 == 0:
                     elapsed = time.time() - t_start
-                    rate = n_done / elapsed
+                    rate = (n_done - n_prior_done) / elapsed
                     eta_min = (n_total - n_done) / rate / 60.0
                     print(
                         f"[{n_done}/{n_total}] {spec.tag} v={v} "
@@ -316,17 +372,48 @@ def generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--n-compositions", type=int, default=4)
-    parser.add_argument("--arrangements-per-level", type=int, default=10)
+    parser.add_argument(
+        "--n-train",
+        type=int,
+        default=16,
+        help="Compositions in the breadth (training) pool.",
+    )
+    parser.add_argument(
+        "--train-per-level",
+        type=int,
+        default=5,
+        help="Arrangements per vacancy level for each training composition.",
+    )
+    parser.add_argument(
+        "--n-reference",
+        type=int,
+        default=2,
+        help="Compositions in the depth (brute-force reference) pool.",
+    )
+    parser.add_argument(
+        "--reference-per-level",
+        type=int,
+        default=60,
+        help="Arrangements per vacancy level for each reference composition.",
+    )
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out", type=Path, default=Path("data/full/factory_v1.json"))
+    parser.add_argument("--out", type=Path, default=Path("data/full/factory_v2.json"))
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip relaxations already present in --out, replaying the same RNG "
+        "stream so the remaining draws match a from-scratch run.",
+    )
     args = parser.parse_args()
 
     generate(
-        n_compositions=args.n_compositions,
-        arrangements_per_level=args.arrangements_per_level,
+        n_train=args.n_train,
+        train_per_level=args.train_per_level,
+        n_reference=args.n_reference,
+        reference_per_level=args.reference_per_level,
         seed=args.seed,
         out_path=args.out,
+        resume=args.resume,
     )
 
 
