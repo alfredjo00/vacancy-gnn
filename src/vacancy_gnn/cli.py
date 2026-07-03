@@ -1,7 +1,9 @@
 """Command-line interface.
 
-``train``, ``evaluate``, and ``predict`` all run end-to-end against synthetic
-data until the offline factory export lands (PLAN.md step 7); ``gibbs`` only
+``train``, ``evaluate``, and ``predict`` load a factory export (PLAN.md step 7)
+through :func:`vacancy_gnn.data.factory.load_factory_export`, defaulting to the
+small committed ``data/sample/factory_sample.json``; pass ``--data`` to point at
+``data/full/factory_v2.json`` or another export for a real run. ``gibbs`` only
 depends on the pure physics core and needs no dataset.
 """
 
@@ -12,10 +14,8 @@ from pathlib import Path
 import typer
 
 from vacancy_gnn import __version__
-from vacancy_gnn.data.synthetic import (
-    make_brute_force_reference,
-    make_synthetic_dataset,
-)
+from vacancy_gnn.data.factory import load_factory_export
+from vacancy_gnn.data.schema import Dataset
 from vacancy_gnn.evaluate import evaluate as run_evaluation
 from vacancy_gnn.models import LinearBaseline
 from vacancy_gnn.physics import free_energy
@@ -29,6 +29,20 @@ app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
 )
+
+_DEFAULT_DATA = Path("data/sample/factory_sample.json")
+
+
+def _load(data: Path) -> tuple[Dataset, Dataset]:
+    """Load a factory export, exiting with a clear message if it is missing."""
+    if not data.exists():
+        typer.echo(
+            f"no factory export at {data}; generate one with "
+            "scripts/generate_factory_data.py or point --data at an existing file",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return load_factory_export(data)
 
 
 @app.command()
@@ -57,6 +71,9 @@ def gibbs(
 
 @app.command()
 def train(
+    data: Path = typer.Option(
+        _DEFAULT_DATA, "--data", help="Factory export to train on ('train' subset)."
+    ),
     regularization: float = typer.Option(
         1e-3, "--reg", help="Ridge penalty for the linear baseline."
     ),
@@ -66,16 +83,12 @@ def train(
         None, "--checkpoint-dir", help="Directory to save the fitted model."
     ),
 ) -> None:
-    """Train the linear baseline on a synthetic dataset (real end-to-end run).
-
-    Uses synthetic data until the factory export lands (PLAN.md step 4); the GNN
-    plugs into the same loop later.
-    """
-    dataset = make_synthetic_dataset(seed=seed)
+    """Train the linear baseline on a factory export's training split."""
+    train_set, _reference = _load(data)
     model = LinearBaseline(regularization=regularization)
     result = run_training(
         model,
-        dataset,
+        train_set,
         cutoff=cutoff,
         checkpoint_dir=checkpoint_dir,
         seed=seed,
@@ -90,6 +103,11 @@ def train(
 
 @app.command()
 def evaluate(
+    data: Path = typer.Option(
+        _DEFAULT_DATA,
+        "--data",
+        help="Factory export to train on and evaluate against.",
+    ),
     regularization: float = typer.Option(
         1e-3, "--reg", help="Ridge penalty for the linear baseline."
     ),
@@ -99,19 +117,16 @@ def evaluate(
     ),
     seed: int = typer.Option(0, "--seed", help="Random seed."),
 ) -> None:
-    """Evaluate a freshly trained baseline against a brute-force reference.
+    """Evaluate a freshly trained baseline against the brute-force reference split.
 
-    Trains on synthetic data and scores against
-    :func:`vacancy_gnn.data.synthetic.make_brute_force_reference` until the
-    factory export lands (PLAN.md step 6/7); reports the harness in PLAN.md
-    Section 7 (parity MAE/RMSE and the per-composition min-vs-average
-    divergence).
+    Trains on the export's ``train`` subset and scores against its ``reference``
+    subset (PLAN.md Section 7): parity MAE/RMSE and the per-composition
+    min-vs-average divergence.
     """
-    dataset = make_synthetic_dataset(seed=seed)
+    train_set, reference = _load(data)
     model = LinearBaseline(regularization=regularization)
-    run_training(model, dataset, cutoff=cutoff, seed=seed)
+    run_training(model, train_set, cutoff=cutoff, seed=seed)
 
-    reference = make_brute_force_reference(seed=seed + 1000)
     report = run_evaluation(
         model, reference, reactor_temperature=temperature, cutoff=cutoff, seed=seed
     )
@@ -136,8 +151,13 @@ def evaluate(
 def predict(
     composition: str = typer.Option(..., "--composition", help="Composition tag."),
     vacancies: int = typer.Option(..., "--vacancies", "-v", help="Vacancy count."),
+    data: Path = typer.Option(
+        _DEFAULT_DATA,
+        "--data",
+        help="Factory export to train on; candidates come from its 'reference' subset.",
+    ),
     n_candidates: int = typer.Option(
-        50, "--n-candidates", help="Number of candidate arrangements to score."
+        50, "--n-candidates", help="Max candidate arrangements to score."
     ),
     regularization: float = typer.Option(
         1e-3, "--reg", help="Ridge penalty for the linear baseline."
@@ -150,25 +170,20 @@ def predict(
 ) -> None:
     """Predict the Boltzmann-averaged G(v) for a composition and vacancy count.
 
-    Trains on synthetic data, then scores ``n_candidates`` freshly sampled
-    arrangements at the requested vacancy count and averages the predictions
-    (PLAN.md step 6). ``composition`` selects among the brute-force reference
-    compositions generated for this run.
+    Trains on the export's ``train`` subset, then scores up to ``n_candidates``
+    arrangements at the requested composition and vacancy count drawn from its
+    ``reference`` subset, and Boltzmann-averages the predictions (PLAN.md
+    Section 6).
     """
-    dataset = make_synthetic_dataset(seed=seed)
+    train_set, reference = _load(data)
     model = LinearBaseline(regularization=regularization)
-    run_training(model, dataset, cutoff=cutoff, seed=seed)
+    run_training(model, train_set, cutoff=cutoff, seed=seed)
 
-    reference = make_brute_force_reference(
-        vacancy_levels=(vacancies,),
-        arrangements_per_level=n_candidates,
-        seed=seed + 1000,
-    )
     candidates = [
         a
         for a in reference.arrangements
         if a.composition == composition and a.v == vacancies
-    ]
+    ][:n_candidates]
     if not candidates:
         available = sorted(reference.compositions())
         typer.echo(
