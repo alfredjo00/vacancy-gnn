@@ -40,7 +40,7 @@ def test_predict_runs_end_to_end() -> None:
         [
             "predict",
             "--composition",
-            "FeMnAl-ref-000",
+            "Ga9Li6Ni5Sn1Ti5V6Zr4O48-factory-016",
             "--vacancies",
             "2",
             "--seed",
@@ -58,3 +58,9 @@ def test_predict_unknown_composition_reports_available() -> None:
     )
     assert result.exit_code == 1
     assert "available compositions" in result.output
+
+
+def test_train_missing_data_file_reports_error() -> None:
+    result = runner.invoke(app, ["train", "--data", "data/does_not_exist.json"])
+    assert result.exit_code == 1
+    assert "no factory export" in result.output

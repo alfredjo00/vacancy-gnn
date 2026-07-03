@@ -39,3 +39,4 @@ data/full/
 # Local Claude Code config (personal, not for the public repo)
 .claude/settings.local.json
 .claude/
+logs/
