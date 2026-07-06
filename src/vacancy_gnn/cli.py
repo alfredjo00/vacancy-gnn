@@ -11,13 +11,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import typer
+from numpy.typing import NDArray
 
 from vacancy_gnn import __version__
-from vacancy_gnn.data.factory import load_factory_export
-from vacancy_gnn.data.schema import Dataset
+from vacancy_gnn.data.factory import FactoryExport, load_factory_export
 from vacancy_gnn.evaluate import evaluate as run_evaluation
 from vacancy_gnn.models import LinearBaseline
+from vacancy_gnn.models.reference import prior_from_e0s
 from vacancy_gnn.physics import free_energy
 from vacancy_gnn.physics.constants import T_FR
 from vacancy_gnn.predict import predict_free_energy
@@ -32,8 +34,16 @@ app = typer.Typer(
 
 _DEFAULT_DATA = Path("data/sample/factory_sample.json")
 
+#: Default shrinkage toward the E0 prior: OFF. The measurement gate for E0
+#: anchoring failed (IMPROVEMENTS.md P8 addendum: raw isolated-atom energies
+#: miss the element-specific cohesive term by -7 to -18 eV/atom, so prior-only
+#: predictions are far worse than the plain fit, and no shrinkage value
+#: recovers it). The machinery stays available for a future, better prior;
+#: with shrinkage 0.0 the prior is ignored and the fit is the plain lstsq.
+_DEFAULT_REFERENCE_SHRINKAGE = 0.0
 
-def _load(data: Path) -> tuple[Dataset, Dataset]:
+
+def _load(data: Path) -> FactoryExport:
     """Load a factory export, exiting with a clear message if it is missing."""
     if not data.exists():
         typer.echo(
@@ -43,6 +53,30 @@ def _load(data: Path) -> tuple[Dataset, Dataset]:
         )
         raise typer.Exit(1)
     return load_factory_export(data)
+
+
+def _reference_prior(export: FactoryExport) -> NDArray[np.float64] | None:
+    """Build the E0 prior for ``export``, or ``None`` if it has no E0s.
+
+    Only consulted when ``_DEFAULT_REFERENCE_SHRINKAGE`` is nonzero; with
+    anchoring off (the current default, see that constant's docstring) the
+    prior is passed through but ignored by ``CompositionReference.fit``.
+
+    Reads ``n_cations``/``n_oxygen_sites`` off the first training arrangement;
+    every arrangement in a factory export shares one fixed cell (see
+    :mod:`scripts.generate_factory_data`).
+    """
+    if not export.e0s_ev:
+        return None
+    arrangements = export.train.arrangements or export.reference.arrangements
+    if not arrangements:
+        return None
+    sample = arrangements[0]
+    return prior_from_e0s(
+        export.e0s_ev,
+        n_cations=len(sample.cation_species),
+        n_oxygen_sites=len(sample.oxygen_positions),
+    )
 
 
 @app.command()
@@ -84,11 +118,16 @@ def train(
     ),
 ) -> None:
     """Train the linear baseline on a factory export's training split."""
-    train_set, _reference = _load(data)
-    model = LinearBaseline(regularization=regularization)
+    export = _load(data)
+    prior = _reference_prior(export)
+    model = LinearBaseline(
+        regularization=regularization,
+        reference_prior=prior,
+        reference_shrinkage=_DEFAULT_REFERENCE_SHRINKAGE if prior is not None else 0.0,
+    )
     result = run_training(
         model,
-        train_set,
+        export.train,
         cutoff=cutoff,
         checkpoint_dir=checkpoint_dir,
         seed=seed,
@@ -123,17 +162,29 @@ def evaluate(
     subset (PLAN.md Section 7): parity MAE/RMSE and the per-composition
     min-vs-average divergence.
     """
-    train_set, reference = _load(data)
-    model = LinearBaseline(regularization=regularization)
-    run_training(model, train_set, cutoff=cutoff, seed=seed)
+    export = _load(data)
+    prior = _reference_prior(export)
+    model = LinearBaseline(
+        regularization=regularization,
+        reference_prior=prior,
+        reference_shrinkage=_DEFAULT_REFERENCE_SHRINKAGE if prior is not None else 0.0,
+    )
+    run_training(model, export.train, cutoff=cutoff, seed=seed)
 
     report = run_evaluation(
-        model, reference, reactor_temperature=temperature, cutoff=cutoff, seed=seed
+        model,
+        export.reference,
+        reactor_temperature=temperature,
+        cutoff=cutoff,
+        seed=seed,
+        train=export.train,
     )
 
     typer.echo(
         f"parity: MAE={report.parity.mae:.4f} eV  RMSE={report.parity.rmse:.4f} eV"
     )
+    for warning in report.out_of_hull_warnings:
+        typer.echo(f"warning: {warning}", err=True)
     for est in report.free_energy_accuracy:
         typer.echo(
             f"{est.composition} v={est.v}: truth={est.truth:.4f} eV  "
@@ -175,10 +226,16 @@ def predict(
     ``reference`` subset, and Boltzmann-averages the predictions (PLAN.md
     Section 6).
     """
-    train_set, reference = _load(data)
-    model = LinearBaseline(regularization=regularization)
-    run_training(model, train_set, cutoff=cutoff, seed=seed)
+    export = _load(data)
+    prior = _reference_prior(export)
+    model = LinearBaseline(
+        regularization=regularization,
+        reference_prior=prior,
+        reference_shrinkage=_DEFAULT_REFERENCE_SHRINKAGE if prior is not None else 0.0,
+    )
+    run_training(model, export.train, cutoff=cutoff, seed=seed)
 
+    reference = export.reference
     candidates = [
         a
         for a in reference.arrangements

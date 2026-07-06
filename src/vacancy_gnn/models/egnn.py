@@ -205,6 +205,8 @@ class EquivariantGNN:
         learning_rate: float = 1e-3,
         seed: int = 0,
         device: str = "cpu",
+        reference_prior: NDArray[np.float64] | None = None,
+        reference_shrinkage: float = 0.0,
     ) -> None:
         self.config = {
             "hidden": hidden,
@@ -216,6 +218,13 @@ class EquivariantGNN:
             "seed": seed,
         }
         self.device = torch.device(device)
+        #: Optional composition-reference anchor and shrinkage strength (see
+        #: :meth:`vacancy_gnn.models.reference.CompositionReference.fit` and
+        #: IMPROVEMENTS.md P8); ``reference_shrinkage=0.0`` (the default)
+        #: reproduces the plain unconstrained reference fit. Not part of
+        #: ``config`` since it is not saved/loaded (see :meth:`save`).
+        self.reference_prior = reference_prior
+        self.reference_shrinkage = reference_shrinkage
         self._net: _EGNNNet | None = None
         self._target_mean: float = 0.0
         self._target_std: float = 1.0
@@ -239,7 +248,12 @@ class EquivariantGNN:
 
         # Learn only the per-arrangement residual over a per-species reference.
         self._reference = CompositionReference()
-        self._reference.fit(graphs, y)
+        self._reference.fit(
+            graphs,
+            y,
+            prior=self.reference_prior,
+            shrinkage=self.reference_shrinkage,
+        )
         residual = y - self._reference.predict(graphs)
 
         self._target_mean = float(residual.mean())
