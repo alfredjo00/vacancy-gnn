@@ -36,7 +36,9 @@ data/full/
 .idea/
 .DS_Store
 
-# Local Claude Code config (personal, not for the public repo)
+# Local tooling / notes (personal, not for the public repo)
 .claude/settings.local.json
 .claude/
+CLAUDE.md
+PLAN.md
 logs/
