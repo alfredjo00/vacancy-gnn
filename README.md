@@ -89,7 +89,9 @@ release polish and the dataset asset.
 The GNN needs the optional `ml` extra (`pip install -e ".[ml]"`, which pulls in
 torch); the rest of the package installs and runs without it, so CI stays green
 both with and without torch. Reproducing the money figure notebook needs the
-`viz` extra (matplotlib) plus Jupyter and the gitignored full dataset.
+`viz` extra (matplotlib) plus Jupyter and the full dataset, which is attached
+to the GitHub release along with the trained checkpoint; see
+[`data/README.md`](data/README.md) for download and provenance.
 
 ## Quickstart
 
