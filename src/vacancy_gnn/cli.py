@@ -183,6 +183,13 @@ def evaluate(
     typer.echo(
         f"parity: MAE={report.parity.mae:.4f} eV  RMSE={report.parity.rmse:.4f} eV"
     )
+    typer.echo(
+        "parity (per-composition offset removed): "
+        f"MAE={report.parity.offset_corrected_mae:.4f} eV  "
+        f"RMSE={report.parity.offset_corrected_rmse:.4f} eV"
+    )
+    for comp, offset in report.parity.composition_offsets.items():
+        typer.echo(f"  {comp}: offset {offset:+.4f} eV")
     for warning in report.out_of_hull_warnings:
         typer.echo(f"warning: {warning}", err=True)
     for est in report.free_energy_accuracy:
