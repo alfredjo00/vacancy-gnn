@@ -36,19 +36,38 @@ from vacancy_gnn.data.featurize import Graph
 from vacancy_gnn.models.reference import CompositionReference
 
 
-def _graph_to_tensors(
-    graph: Graph, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Convert a numpy Graph into the tensors the network consumes.
+def _batch_graphs(
+    graphs: list[Graph], device: torch.device
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Pack graphs into one block-diagonal batch the network consumes.
+
+    Node arrays are concatenated, edge indices are offset by each graph's node
+    offset, and ``batch`` maps every node to its graph index. There are no
+    cross-graph edges, so one forward over the packed batch is mathematically
+    identical to a forward per graph, while replacing a Python loop of tiny
+    kernel launches with a few large ones.
 
     Vacancy markers arrive as nodes with :data:`VACANCY_MARKER_Z` (0), so they
     flow through the same embedding table as cations; no separate vacancy feature
     is needed.
     """
-    z = torch.from_numpy(graph.node_z.astype(np.int64)).to(device)
-    edge_index = torch.from_numpy(graph.edge_index.astype(np.int64)).to(device)
-    edge_vec = torch.from_numpy(graph.edge_vec.astype(np.float32)).to(device)
-    return z, edge_index, edge_vec
+    z_parts: list[NDArray[np.int64]] = []
+    edge_parts: list[NDArray[np.int64]] = []
+    vec_parts: list[NDArray[np.float32]] = []
+    batch_parts: list[NDArray[np.int64]] = []
+    offset = 0
+    for i, graph in enumerate(graphs):
+        n_nodes = graph.node_z.shape[0]
+        z_parts.append(graph.node_z.astype(np.int64))
+        edge_parts.append(graph.edge_index.astype(np.int64) + offset)
+        vec_parts.append(graph.edge_vec.astype(np.float32))
+        batch_parts.append(np.full(n_nodes, i, dtype=np.int64))
+        offset += n_nodes
+    z = torch.from_numpy(np.concatenate(z_parts)).to(device)
+    edge_index = torch.from_numpy(np.concatenate(edge_parts, axis=1)).to(device)
+    edge_vec = torch.from_numpy(np.concatenate(vec_parts, axis=0)).to(device)
+    batch = torch.from_numpy(np.concatenate(batch_parts)).to(device)
+    return z, edge_index, edge_vec, batch
 
 
 class RadialBasis(nn.Module):
@@ -173,7 +192,15 @@ class _EGNNNet(nn.Module):
             nn.Linear(hidden, 1),
         )
 
-    def forward(self, z: Tensor, edge_index: Tensor, edge_vec: Tensor) -> Tensor:
+    def forward(
+        self, z: Tensor, edge_index: Tensor, edge_vec: Tensor, batch: Tensor
+    ) -> Tensor:
+        """Per-graph total energies, shape ``(n_graphs,)``.
+
+        ``batch`` maps each node to its graph index (see :func:`_batch_graphs`);
+        every graph must contribute at least one node, which holds by
+        construction (every arrangement has all its cation sites occupied).
+        """
         s = self.embedding(z)
         v = torch.zeros(z.shape[0], 3, self.hidden, device=z.device)
         dist = torch.linalg.norm(edge_vec, dim=1)
@@ -184,8 +211,10 @@ class _EGNNNet(nn.Module):
             s, v = message(s, v, edge_index, edge_vec, rbf)
             s, v = update(s, v)
         node_energy = self.readout(s).squeeze(-1)
-        total: Tensor = node_energy.sum()
-        return total
+        n_graphs = int(batch[-1].item()) + 1
+        totals = torch.zeros(n_graphs, device=z.device, dtype=node_energy.dtype)
+        totals.index_add_(0, batch, node_energy)
+        return totals
 
 
 class EquivariantGNN:
@@ -203,6 +232,7 @@ class EquivariantGNN:
         cutoff: float = 5.0,
         epochs: int = 200,
         learning_rate: float = 1e-3,
+        batch_size: int = 128,
         seed: int = 0,
         device: str = "cpu",
         reference_prior: NDArray[np.float64] | None = None,
@@ -215,6 +245,7 @@ class EquivariantGNN:
             "cutoff": cutoff,
             "epochs": epochs,
             "learning_rate": learning_rate,
+            "batch_size": batch_size,
             "seed": seed,
         }
         self.device = torch.device(device)
@@ -264,24 +295,38 @@ class EquivariantGNN:
         opt = torch.optim.Adam(
             self._net.parameters(), lr=float(self.config["learning_rate"])
         )
-        tensors = [_graph_to_tensors(g, self.device) for g in graphs]
         target_t = torch.tensor(targets, dtype=torch.float32, device=self.device)
+        batch_size = int(self.config["batch_size"])
+        shuffler = torch.Generator().manual_seed(int(self.config["seed"]))
 
+        # Mini-batch training over block-diagonal packed batches (see
+        # _batch_graphs): one optimizer step per shuffled batch, not one giant
+        # Python loop of per-graph forwards per epoch.
         self._net.train()
         for _ in range(int(self.config["epochs"])):
-            opt.zero_grad()
-            preds = torch.stack([self._net(*t) for t in tensors])
-            loss = nn.functional.mse_loss(preds, target_t)
-            loss.backward()  # type: ignore[no-untyped-call]
-            opt.step()
+            order = torch.randperm(len(graphs), generator=shuffler).tolist()
+            for start in range(0, len(order), batch_size):
+                chunk = order[start : start + batch_size]
+                inputs = _batch_graphs([graphs[i] for i in chunk], self.device)
+                opt.zero_grad()
+                preds = self._net(*inputs)
+                loss = nn.functional.mse_loss(preds, target_t[chunk])
+                loss.backward()  # type: ignore[no-untyped-call]
+                opt.step()
 
     def predict(self, graphs: list[Graph]) -> NDArray[np.float64]:
         if self._net is None or self._reference is None:
             raise RuntimeError("model is not fitted; call fit() first")
+        batch_size = int(self.config["batch_size"])
         self._net.eval()
         with torch.no_grad():
-            tensors = [_graph_to_tensors(g, self.device) for g in graphs]
-            preds = torch.stack([self._net(*t) for t in tensors]).cpu().numpy()
+            chunks = [
+                self._net(
+                    *_batch_graphs(graphs[start : start + batch_size], self.device)
+                )
+                for start in range(0, len(graphs), batch_size)
+            ]
+            preds = torch.cat(chunks).cpu().numpy()
         residual = preds * self._target_std + self._target_mean
         result: NDArray[np.float64] = residual + self._reference.predict(graphs)
         return result.astype(np.float64)
