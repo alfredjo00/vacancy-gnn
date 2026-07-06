@@ -67,12 +67,29 @@ def group_by_composition_and_v(dataset: Dataset) -> list[CompositionLevelGroup]:
 
 @dataclass(frozen=True)
 class ParityResult:
-    """Per-arrangement energy prediction quality against the reference."""
+    """Per-arrangement energy prediction quality against the reference.
+
+    Raw and offset-corrected numbers are reported side by side because every
+    physics deliverable is invariant to a per-composition constant: within a
+    ``(composition, v)`` group all arrangements share one species-count vector,
+    so a constant composition-reference offset cancels out of Boltzmann
+    weights, arrangement ranking, and ``Delta G`` across ``v`` (IMPROVEMENTS.md
+    P8). Only raw cross-composition parity eats the offset, and a single
+    oracle label per new composition pins it exactly. The offset-corrected
+    numbers are therefore the ones that reflect deliverable quality; a large
+    raw-vs-corrected gap means the model is off by per-composition constants,
+    not that its physics is wrong.
+    """
 
     y_true: NDArray[np.float64]
     y_pred: NDArray[np.float64]
     mae: float
     rmse: float
+    #: MAE/RMSE after removing each composition's mean residual (see class
+    #: docstring), and the removed mean signed residual per composition (eV).
+    offset_corrected_mae: float
+    offset_corrected_rmse: float
+    composition_offsets: dict[str, float]
 
 
 def per_arrangement_parity(
@@ -86,13 +103,30 @@ def per_arrangement_parity(
         cutoff: Edge distance cutoff for graph construction; must match training.
 
     Returns:
-        A :class:`ParityResult` with true/predicted energies and MAE/RMSE.
+        A :class:`ParityResult` with true/predicted energies, raw MAE/RMSE, and
+        the per-composition offset-corrected MAE/RMSE (see
+        :class:`ParityResult` for why both are reported).
     """
     graphs = [build_graph(a, cutoff=cutoff) for a in reference.arrangements]
     y_true = np.array([a.energy_ev for a in reference.arrangements], dtype=np.float64)
     y_pred = model.predict(graphs)
+
+    residual = y_pred - y_true
+    compositions = np.array([a.composition for a in reference.arrangements])
+    offsets = {
+        str(c): float(residual[compositions == c].mean())
+        for c in dict.fromkeys(compositions.tolist())
+    }
+    corrected = y_pred - np.array([offsets[c] for c in compositions.tolist()])
+
     return ParityResult(
-        y_true=y_true, y_pred=y_pred, mae=mae(y_true, y_pred), rmse=rmse(y_true, y_pred)
+        y_true=y_true,
+        y_pred=y_pred,
+        mae=mae(y_true, y_pred),
+        rmse=rmse(y_true, y_pred),
+        offset_corrected_mae=mae(y_true, corrected),
+        offset_corrected_rmse=rmse(y_true, corrected),
+        composition_offsets=offsets,
     )
 
 

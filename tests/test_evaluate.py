@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from vacancy_gnn.data.synthetic import (
     make_brute_force_reference,
@@ -54,6 +55,33 @@ def test_per_arrangement_parity_matches_manual_metrics() -> None:
     assert result.y_true.shape == result.y_pred.shape == (20,)
     assert result.mae >= 0.0
     assert result.rmse >= result.mae
+
+
+def test_parity_offset_correction_removes_per_composition_constants() -> None:
+    model = _fitted_baseline()
+    reference = make_brute_force_reference(
+        n_compositions=2, vacancy_levels=(1, 2), arrangements_per_level=10, seed=4
+    )
+    result = per_arrangement_parity(model, reference)
+
+    # One signed offset per reference composition, equal to the mean residual.
+    assert set(result.composition_offsets) == set(
+        a.composition for a in reference.arrangements
+    )
+    compositions = np.array([a.composition for a in reference.arrangements])
+    residual = result.y_pred - result.y_true
+    for comp, offset in result.composition_offsets.items():
+        assert offset == pytest.approx(residual[compositions == comp].mean())
+
+    # Removing each group's mean minimizes its squared error, so corrected
+    # RMSE can only tighten; after correction the per-composition mean
+    # residual is zero by construction.
+    assert result.offset_corrected_rmse <= result.rmse + 1e-12
+    corrected = residual - np.array(
+        [result.composition_offsets[c] for c in compositions.tolist()]
+    )
+    for comp in result.composition_offsets:
+        assert corrected[compositions == comp].mean() == pytest.approx(0.0, abs=1e-9)
 
 
 def test_free_energy_accuracy_one_estimate_per_group() -> None:
