@@ -90,7 +90,7 @@ def test_vector_channel_influences_energy(
     # update block). Zeroing the vector features at every layer should change the
     # prediction; if it did not, the l=1 pathway would be dead weight and the model
     # a distance-only invariant net (the flaw this block fixes).
-    from vacancy_gnn.models.egnn import _graph_to_tensors
+    from vacancy_gnn.models.egnn import _batch_graphs
 
     model = _small_model(epochs=30)
     ds = make_synthetic_dataset(n_compositions=6, seed=11)
@@ -101,16 +101,16 @@ def test_vector_channel_influences_energy(
 
     a = make_arrangement("C", "FeMnAl", vacancy_sites=[0, 1], seed=6)
     a = a.model_copy(update={"cation_species": [26, 25, 13, 27]})
-    tensors = _graph_to_tensors(build_graph(a, cutoff=5.0), model.device)
+    tensors = _batch_graphs([build_graph(a, cutoff=5.0)], model.device)
 
     model._net.eval()
     with torch.no_grad():
-        full = float(model._net(*tensors))
+        full = float(model._net(*tensors)[0])
         # Re-run with the vector features held at zero after every message layer.
         for update in model._net.updates:
             update.u_proj.weight.zero_()
             update.v_proj.weight.zero_()
-        ablated = float(model._net(*tensors))
+        ablated = float(model._net(*tensors)[0])
     assert abs(full - ablated) > 1e-4
 
 
@@ -153,6 +153,21 @@ def test_training_reduces_error() -> None:
     err_after = np.abs(model_more.predict(graphs) - energies).mean()
 
     assert err_after < err_before
+
+
+def test_batched_predict_matches_single_graph_predict() -> None:
+    # Block-diagonal batching must be a pure speed change: packing graphs into
+    # one forward (including an uneven final chunk) gives the same energies as
+    # predicting them one at a time.
+    ds = make_synthetic_dataset(n_compositions=4, seed=9)
+    graphs = [build_graph(a, cutoff=5.0) for a in ds.arrangements]
+    energies = np.array([a.energy_ev for a in ds.arrangements])
+    model = _small_model(batch_size=5)
+    model.fit(graphs, energies)
+
+    batched = model.predict(graphs)
+    single = np.concatenate([model.predict([g]) for g in graphs])
+    np.testing.assert_allclose(batched, single, atol=1e-4)
 
 
 def test_predict_before_fit_raises() -> None:
