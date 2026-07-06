@@ -355,5 +355,7 @@ class EquivariantGNN:
         model._reference = CompositionReference.from_list(payload["reference"])
         model._net = model._build_net()
         weights_path = path.with_name(payload["weights_file"])
-        model._net.load_state_dict(torch.load(weights_path, map_location=model.device))
+        model._net.load_state_dict(
+            torch.load(weights_path, map_location=model.device, weights_only=True)
+        )
         return model
