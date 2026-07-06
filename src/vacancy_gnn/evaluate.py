@@ -25,7 +25,15 @@ from vacancy_gnn.data.featurize import build_graph
 from vacancy_gnn.data.schema import Dataset
 from vacancy_gnn.metrics import free_energy_convergence, mae, rmse
 from vacancy_gnn.models.base import EnergyModel
+from vacancy_gnn.models.reference import out_of_span_norm
 from vacancy_gnn.physics.boltzmann import free_energy, free_energy_sweep
+
+#: Above this out-of-span norm, a held-out composition's reference energy is
+#: extrapolated far enough outside the training hull that its accuracy numbers
+#: should be read as an honest failure mode rather than typical performance
+#: (IMPROVEMENTS.md P8). Chosen from the real factory data, where a norm of
+#: ~2 already corresponds to double-digit-eV reference offsets.
+OUT_OF_HULL_NORM_THRESHOLD = 1.0
 
 
 @dataclass(frozen=True)
@@ -319,6 +327,51 @@ def temperature_sweeps(
 
 
 @dataclass(frozen=True)
+class OutOfHullNorm:
+    """Composition-reference extrapolation leverage for one held-out composition.
+
+    See :func:`vacancy_gnn.models.reference.out_of_span_norm` and
+    IMPROVEMENTS.md P8: a large ``norm`` means the composition reference had to
+    extrapolate outside the training hull for this composition, so its parity/
+    free-energy numbers should be read as a flagged failure mode rather than
+    typical accuracy.
+    """
+
+    composition: str
+    norm: float
+
+
+def out_of_hull_norms(
+    train: Dataset, reference: Dataset, *, cutoff: float = 5.0
+) -> list[OutOfHullNorm]:
+    """Out-of-span norm of every reference composition against the training hull.
+
+    Args:
+        train: The training dataset the composition reference was fit on.
+        reference: The brute-force reference dataset.
+        cutoff: Edge distance cutoff for graph construction; must match training.
+
+    Returns:
+        One :class:`OutOfHullNorm` per distinct reference composition.
+    """
+    train_graphs = [build_graph(a, cutoff=cutoff) for a in train.arrangements]
+    results: list[OutOfHullNorm] = []
+    seen: set[str] = set()
+    for a in reference.arrangements:
+        if a.composition in seen:
+            continue
+        seen.add(a.composition)
+        graph = build_graph(a, cutoff=cutoff)
+        results.append(
+            OutOfHullNorm(
+                composition=a.composition,
+                norm=out_of_span_norm(train_graphs, graph),
+            )
+        )
+    return results
+
+
+@dataclass(frozen=True)
 class EvaluationReport:
     """Full evaluation harness output (PLAN.md Section 7)."""
 
@@ -327,6 +380,19 @@ class EvaluationReport:
     oracle_efficiency: list[ConvergenceCurve]
     min_vs_average: list[MinVsAverageDivergence]
     temperature_sweeps: list[TemperatureSweep] = field(repr=False)
+    out_of_hull: list[OutOfHullNorm] = field(default_factory=list)
+
+    @property
+    def out_of_hull_warnings(self) -> list[str]:
+        """Human-readable warnings for compositions over
+        :data:`OUT_OF_HULL_NORM_THRESHOLD`."""
+        return [
+            f"{item.composition} is out-of-hull for the composition reference "
+            f"(norm={item.norm:.2f}); its accuracy numbers reflect extrapolation, "
+            "not typical performance (IMPROVEMENTS.md P8)"
+            for item in self.out_of_hull
+            if item.norm > OUT_OF_HULL_NORM_THRESHOLD
+        ]
 
 
 def evaluate(
@@ -337,6 +403,7 @@ def evaluate(
     cutoff: float = 5.0,
     sweep_temperatures: NDArray[np.float64] | list[float] | None = None,
     seed: int = 0,
+    train: Dataset | None = None,
 ) -> EvaluationReport:
     """Run the full evaluation harness against a brute-force reference dataset.
 
@@ -349,6 +416,10 @@ def evaluate(
         sweep_temperatures: Temperature grid for the T-sweep; defaults to
             ``0`` through ``2 * reactor_temperature``.
         seed: RNG seed for the single-draw and random-order baselines.
+        train: The training dataset ``model`` was fit on. If given, the report
+            includes :attr:`EvaluationReport.out_of_hull` (IMPROVEMENTS.md P8);
+            if omitted, ``out_of_hull`` is empty (e.g. for callers without
+            access to the training set).
 
     Returns:
         An :class:`EvaluationReport` bundling every metric in PLAN.md Section 7.
@@ -369,5 +440,10 @@ def evaluate(
         ),
         temperature_sweeps=temperature_sweeps(
             reference, temperatures=sweep_temperatures
+        ),
+        out_of_hull=(
+            out_of_hull_norms(train, reference, cutoff=cutoff)
+            if train is not None
+            else []
         ),
     )

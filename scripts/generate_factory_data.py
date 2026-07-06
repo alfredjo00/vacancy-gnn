@@ -44,8 +44,19 @@ to run this script, e.g.:
 Usage:
     python scripts/generate_factory_data.py --out data/full/factory_v2.json
 
+To grow an existing dataset instead of regenerating it, use --extend: it keeps
+every arrangement, E0, and the reference split from the input export and only
+relaxes new training compositions, so no prior GPU work is repeated. Append 14
+more training compositions (v2 -> v3), or double the training pool:
+
+    python scripts/generate_factory_data.py \\
+        --extend data/full/factory_v2.json --n-add 14 --out data/full/factory_v3.json
+    python scripts/generate_factory_data.py \\
+        --extend data/full/factory_v2.json --out data/full/factory_v3.json  # doubles
+
 Writes partial results to ``out_path`` every 10 relaxations, so a crash or
-interrupt loses at most that much GPU work; rerun with --resume to continue.
+interrupt loses at most that much GPU work; rerun with --resume to continue
+(for --extend, --resume continues a partially finished extend in --out).
 """
 
 from __future__ import annotations
@@ -251,6 +262,11 @@ def build_arrangement_atoms(
 RELAX_FMAX = 0.05
 SOURCE_RUN = "generate_factory_data.py-v2-mace-mpa-0-fmax0.05"
 
+#: XORed into the seed by :func:`extend` so appended compositions come from a
+#: different RNG stream than the base run, and can never accidentally reproduce
+#: a composition the base run already drew.
+_EXTEND_SEED_SALT = 0x5EEDE
+
 
 def relax_energy_ev(atoms: object, calc: object) -> float:
     """Relax ``atoms`` with MACE-MPA-0 (BFGS, cell + ions) and return final energy."""
@@ -264,10 +280,48 @@ def relax_energy_ev(atoms: object, calc: object) -> float:
     return float(atoms.get_potential_energy())  # type: ignore[attr-defined]
 
 
-def _write_checkpoint(records: list[dict[str, object]], out_path: Path) -> None:
+#: Side length (A) of the empty box an isolated atom is placed in for
+#: :func:`compute_e0s_ev`. Large enough that periodic images don't interact.
+ISOLATED_ATOM_BOX_A = 20.0
+
+
+def compute_e0s_ev(elements: list[str], calc: object) -> dict[str, float]:
+    """Single-atom reference energies (eV) for ``elements`` plus oxygen.
+
+    These are the trivial per-element offsets that
+    :func:`vacancy_gnn.models.reference.prior_from_e0s` anchors the
+    composition reference to (IMPROVEMENTS.md P8): a physically motivated
+    center for directions the training compositions don't constrain, instead
+    of an arbitrary minimum-norm value. One single-point energy per element in
+    a large empty box; seconds of compute, no relaxation, no GPU needed.
+
+    Args:
+        elements: Element symbols to compute (oxygen is always included; pass
+            the union of the run's A-site/B-site pools).
+        calc: An ASE calculator (e.g. from ``mace_mp``).
+
+    Returns:
+        Mapping from element symbol to isolated-atom energy (eV).
+    """
+    from ase import Atoms
+
+    symbols = sorted({*elements, "O"})
+    e0s: dict[str, float] = {}
+    for symbol in symbols:
+        atoms = Atoms(
+            symbol, positions=[[0.0, 0.0, 0.0]], cell=[ISOLATED_ATOM_BOX_A] * 3
+        )
+        atoms.calc = calc  # type: ignore[attr-defined]
+        e0s[symbol] = float(atoms.get_potential_energy())  # type: ignore[attr-defined]
+    return e0s
+
+
+def _write_checkpoint(
+    records: list[dict[str, object]], e0s_ev: dict[str, float], out_path: Path
+) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps({"arrangements": records}))
+    tmp_path.write_text(json.dumps({"arrangements": records, "e0s_ev": e0s_ev}))
     tmp_path.replace(out_path)
 
 
@@ -288,39 +342,196 @@ def _composition_plan(
     return plan
 
 
-def generate(
+#: Element pool for the composition-reference coverage check, ordered like
+#: vacancy_gnn.data.descriptors.DESCRIPTOR_SPECIES (cations only; the vacancy
+#: marker isn't a composition-plan concern since v varies within every
+#: composition and is always well constrained by data).
+_PREFLIGHT_ELEMENTS: tuple[str, ...] = (
+    "Li",
+    "Mg",
+    "Al",
+    "Ca",
+    "Ti",
+    "V",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
+    "Zn",
+    "Ga",
+    "Zr",
+    "In",
+    "Sn",
+)
+
+
+def _cation_count_vector(cation_species: list[int]) -> np.ndarray:
+    """Per-element counts over :data:`_PREFLIGHT_ELEMENTS`, from atomic numbers."""
+    from ase.data import atomic_numbers
+
+    order = [atomic_numbers[e] for e in _PREFLIGHT_ELEMENTS]
+    idx = {z: i for i, z in enumerate(order)}
+    counts = np.zeros(len(_PREFLIGHT_ELEMENTS), dtype=np.float64)
+    for z in cation_species:
+        counts[idx[z]] += 1.0
+    return counts
+
+
+def _out_of_span_norm(train_counts: np.ndarray, counts: np.ndarray) -> float:
+    """Norm of ``counts`` orthogonal to the row space spanned by ``train_counts``.
+
+    Same operation as vacancy_gnn.models.reference.out_of_span_norm, reimplemented
+    here directly on count vectors (no Graph needed) so this pre-flight check has
+    no dependency on the installed package or a relaxed structure.
+    """
+    _, s, vt = np.linalg.svd(train_counts, full_matrices=False)
+    basis = vt[s > 1e-8 * s[0]] if s.size else vt[:0]
+    projection = basis.T @ (basis @ counts)
+    return float(np.linalg.norm(counts - projection))
+
+
+def _replay_plan_specs(
     n_train: int,
     train_per_level: int,
     n_reference: int,
     reference_per_level: int,
     seed: int,
-    out_path: Path,
-    resume: bool,
-) -> None:
-    from mace.calculators import mace_mp
+) -> list[CompositionSpec]:
+    """The exact composition specs a :func:`generate` run with these args builds.
 
+    :func:`generate` interleaves per-arrangement RNG draws (cation shuffles,
+    vacancy sets) between composition builds, so the spec for composition ``c``
+    depends on how many arrangements every earlier composition consumed. This
+    replays that stream faithfully (burning the arrangement draws without
+    relaxing anything), so pre-flight sees the same compositions the real run
+    would.
+    """
     rng = np.random.default_rng(seed)
-
-    records: list[dict[str, object]] = []
-    n_prior_done = 0
-    if resume and out_path.exists():
-        records = json.loads(out_path.read_text())["arrangements"]
-        n_prior_done = len(records)
-        print(f"resuming: {n_prior_done} arrangements already in {out_path}")
-
-    calc = mace_mp(model="medium-mpa-0", device="cuda", default_dtype="float64")
-
     plan = _composition_plan(n_train, train_per_level, n_reference, reference_per_level)
+    specs: list[CompositionSpec] = []
+    for c, per_level in plan:
+        spec = build_composition(rng, c)
+        specs.append(spec)
+        n_oxygen_sites = len(spec.oxygen_positions)
+        for v in VACANCY_LEVELS:
+            for _ in range(per_level):
+                shuffle_cation_arrangement(rng, spec)
+                rng.choice(n_oxygen_sites, size=v, replace=False)
+    return specs
+
+
+def preflight(
+    n_train: int,
+    train_per_level: int,
+    n_reference: int,
+    reference_per_level: int,
+    seed: int,
+) -> None:
+    """Check composition-reference coverage before spending any GPU time.
+
+    Builds only the composition plan (no relaxation, no GPU) for the exact run
+    these arguments describe (see :func:`_replay_plan_specs`), then reports:
+
+    - The rank of the training cation-count design matrix (must be
+      ``len(_PREFLIGHT_ELEMENTS)`` for the composition reference to even be
+      identifiable; see IMPROVEMENTS.md P8).
+    - Each element's count range across the training compositions.
+    - Each reference composition's out-of-span norm against the training
+      compositions (see vacancy_gnn.models.reference.out_of_span_norm) and its
+      statistical leverage ``x^T (X^T X)^+ x``. The norm catches the
+      rank-deficient failure (nonzero = the reference composition needs a
+      direction training never constrains); once the design is full rank the
+      norm is identically zero and leverage is the sharper flag (>~1 means the
+      fit must extrapolate toward a hull corner, the -168 eV swap-test regime
+      from IMPROVEMENTS.md P8's addendum).
+
+    Both flags are leading indicators of the exact P8 failure, cheap enough to
+    check before burning GPU-hours on the full factory.
+    """
+    specs = _replay_plan_specs(
+        n_train, train_per_level, n_reference, reference_per_level, seed
+    )
+    train_counts = np.stack(
+        [_cation_count_vector(s.cation_counts) for s in specs[:n_train]]
+    )
+    rank = np.linalg.matrix_rank(train_counts)
+    n_species = len(_PREFLIGHT_ELEMENTS)
+
+    print(f"{n_train} training compositions, {n_species} cation species")
+    print(f"design matrix rank: {rank} of {n_species}", end="")
+    print(" (full rank)" if rank == n_species else " (RANK-DEFICIENT)")
+
+    print("\nper-element count range across training compositions:")
+    for i, sym in enumerate(_PREFLIGHT_ELEMENTS):
+        col = train_counts[:, i]
+        present = int((col > 0).sum())
+        print(
+            f"  {sym:3s} range=[{col.min():.0f},{col.max():.0f}]  "
+            f"in {present}/{n_train} compositions"
+        )
+
+    xtx_pinv = np.linalg.pinv(train_counts.T @ train_counts)
+    print("\nreference compositions vs training hull:")
+    any_flagged = False
+    for spec in specs[n_train:]:
+        counts = _cation_count_vector(spec.cation_counts)
+        norm = _out_of_span_norm(train_counts, counts)
+        leverage = float(counts @ xtx_pinv @ counts)
+        flag = ""
+        if norm > 1.0 or leverage > 1.5:
+            flag = "  <-- likely large composition-reference error (IMPROVEMENTS.md P8)"
+            any_flagged = True
+        print(f"  {spec.tag:50s} oos-norm={norm:.3f}  leverage={leverage:.2f}{flag}")
+
+    if rank < n_species or any_flagged:
+        print(
+            "\nPRE-FLIGHT WARNING: composition-reference coverage looks weak for "
+            "this plan; consider more/broader training compositions before "
+            "running the full (GPU) factory."
+        )
+    else:
+        print("\npre-flight OK: full rank, no reference composition flagged.")
+
+
+def _relax_plan(
+    plan: list[tuple[int, int, str]],
+    rng: np.random.Generator,
+    calc: object,
+    e0s_ev: dict[str, float],
+    records: list[dict[str, object]],
+    out_path: Path,
+    *,
+    n_prior_done: int,
+    source_run: str,
+) -> None:
+    """Relax every arrangement in ``plan``, appending records and checkpointing.
+
+    ``plan`` is a list of ``(composition_index, per_level, subset)`` tuples;
+    each entry builds one composition and relaxes ``per_level`` arrangements at
+    every vacancy level. Arrangement RNG draws always happen (so the stream is
+    identical to a fresh run), but the first ``n_prior_done`` arrangements *that
+    this plan produces* are skipped, which is what lets ``--resume`` continue an
+    interrupted run.
+
+    ``n_prior_done`` is plan-relative: it counts only arrangements this plan
+    generates, not any records already present in ``records`` from another
+    source. ``extend`` seeds ``records`` with a preserved base and passes a
+    ``n_prior_done`` of 0 (fresh) or the count of new arrangements already
+    finished (resume), so the base is appended-around, never skipped-over.
+
+    Mutates ``records`` in place and writes ``out_path`` every 10 relaxations.
+    """
     n_oxygen_sites = None
     t_start = time.time()
-    n_total = sum(count for _, count in plan) * len(VACANCY_LEVELS)
+    n_total = sum(per_level for _, per_level, _ in plan) * len(VACANCY_LEVELS)
     n_done = 0
 
-    for c, per_level in plan:
+    for c, per_level, subset in plan:
         spec = build_composition(rng, c)
         if n_oxygen_sites is None:
             n_oxygen_sites = len(spec.oxygen_positions)
-        is_reference = c >= n_train
 
         for v in VACANCY_LEVELS:
             for _ in range(per_level):
@@ -342,7 +553,7 @@ def generate(
                     {
                         "composition": spec.tag,
                         "family": "HEO-spinel-factory-v2",
-                        "subset": "reference" if is_reference else "train",
+                        "subset": subset,
                         "v": v,
                         "cation_species": cation_species,
                         "cation_positions": spec.cation_positions,
@@ -350,11 +561,11 @@ def generate(
                         "vacancy_sites": vacancy_sites,
                         "cell": spec.cell,
                         "energy_ev": energy,
-                        "source_run": SOURCE_RUN,
+                        "source_run": source_run,
                     }
                 )
                 if n_done % 10 == 0:
-                    _write_checkpoint(records, out_path)
+                    _write_checkpoint(records, e0s_ev, out_path)
                 if n_done % 5 == 0:
                     elapsed = time.time() - t_start
                     rate = (n_done - n_prior_done) / elapsed
@@ -366,8 +577,149 @@ def generate(
                         flush=True,
                     )
 
-    _write_checkpoint(records, out_path)
+    _write_checkpoint(records, e0s_ev, out_path)
+
+
+def _load_calc_and_e0s(e0s_ev: dict[str, float]) -> tuple[object, dict[str, float]]:
+    """Load the MACE calculator and fill in E0s if not already known."""
+    from mace.calculators import mace_mp
+
+    calc = mace_mp(model="medium-mpa-0", device="cuda", default_dtype="float64")
+    if not e0s_ev:
+        elements = sorted(set(A_SITE_ELEMENTS) | set(B_SITE_ELEMENTS))
+        e0s_ev = compute_e0s_ev(elements, calc)
+        print(f"computed E0s for {len(e0s_ev)} elements (incl. O)")
+    return calc, e0s_ev
+
+
+def generate(
+    n_train: int,
+    train_per_level: int,
+    n_reference: int,
+    reference_per_level: int,
+    seed: int,
+    out_path: Path,
+    resume: bool,
+) -> None:
+    rng = np.random.default_rng(seed)
+
+    records: list[dict[str, object]] = []
+    e0s_ev: dict[str, float] = {}
+    n_prior_done = 0
+    if resume and out_path.exists():
+        prior = json.loads(out_path.read_text())
+        records = prior["arrangements"]
+        e0s_ev = prior.get("e0s_ev", {})
+        n_prior_done = len(records)
+        print(f"resuming: {n_prior_done} arrangements already in {out_path}")
+
+    calc, e0s_ev = _load_calc_and_e0s(e0s_ev)
+
+    plan = _composition_plan(n_train, train_per_level, n_reference, reference_per_level)
+    subset_plan = [
+        (c, per_level, "reference" if c >= n_train else "train")
+        for c, per_level in plan
+    ]
+    _relax_plan(
+        subset_plan,
+        rng,
+        calc,
+        e0s_ev,
+        records,
+        out_path,
+        n_prior_done=n_prior_done,
+        source_run=SOURCE_RUN,
+    )
     print(f"wrote {len(records)} arrangements -> {out_path}")
+
+
+def _existing_composition_indices(records: list[dict[str, object]]) -> set[int]:
+    """Composition indices already present, parsed from ``-factory-NNN`` tags."""
+    indices: set[int] = set()
+    for r in records:
+        tag = str(r["composition"])
+        suffix = tag.rsplit("-factory-", 1)
+        if len(suffix) == 2 and suffix[1].isdigit():
+            indices.add(int(suffix[1]))
+    return indices
+
+
+def extend(
+    in_path: Path,
+    out_path: Path,
+    n_add: int,
+    train_per_level: int,
+    seed: int,
+    resume: bool,
+) -> None:
+    """Append ``n_add`` new training compositions to an existing export.
+
+    Everything already in ``in_path`` (arrangements, E0s, the reference split)
+    is kept verbatim; only new ``subset="train"`` compositions are relaxed and
+    appended, so no prior GPU work is repeated. New compositions get fresh
+    ``-factory-NNN`` indices continuing past the highest one already present, so
+    their tags never collide with existing records.
+
+    A distinct RNG seed (``seed`` XOR a fixed salt) draws the new compositions,
+    so ``extend`` does not have to replay the original run's stream and cannot
+    accidentally reproduce an existing composition.
+
+    With ``--resume``, ``out_path`` is treated as a checkpoint of a partially
+    finished extend run and continued; otherwise ``in_path`` is the base and
+    ``out_path`` is written fresh (they may be the same file).
+    """
+    base = json.loads(in_path.read_text())
+    base_records: list[dict[str, object]] = base["arrangements"]
+    e0s_ev: dict[str, float] = base.get("e0s_ev", {})
+    base_count = len(base_records)
+
+    # ``records`` accumulates base + newly relaxed arrangements. On a fresh
+    # extend it starts as the base (which is preserved by appending, never
+    # touched by the relax loop). On --resume it starts from the checkpoint,
+    # which already contains base + whatever new work finished before the
+    # interrupt.
+    records = list(base_records)
+    # n_plan_done counts only NEW arrangements the plan has produced (the
+    # skip offset _relax_plan applies), NOT the preserved base records.
+    n_plan_done = 0
+    if resume and out_path.exists() and out_path != in_path:
+        prior = json.loads(out_path.read_text())
+        records = prior["arrangements"]
+        e0s_ev = prior.get("e0s_ev", e0s_ev)
+        n_plan_done = len(records) - base_count
+        print(
+            f"resuming extend: {len(records)} arrangements in {out_path} "
+            f"({n_plan_done} new already done)"
+        )
+    else:
+        print(f"extending {in_path} ({base_count} arrangements) -> {out_path}")
+
+    # Number new compositions past the highest index in the BASE, not in
+    # ``records``: on --resume ``records`` already holds partially-added new
+    # comps, so deriving the start from it would renumber them and desync the
+    # plan from the RNG stream. The base fixes the numbering the same way for
+    # a fresh run and every resume of it.
+    start_index = max(_existing_composition_indices(base_records), default=-1) + 1
+    print(f"adding {n_add} new training compositions from index {start_index}")
+
+    # A distinct stream from the base run: salt the seed so new compositions are
+    # genuinely new draws, never a replay of the original stream.
+    rng = np.random.default_rng(seed ^ _EXTEND_SEED_SALT)
+    calc, e0s_ev = _load_calc_and_e0s(e0s_ev)
+
+    subset_plan = [(start_index + i, train_per_level, "train") for i in range(n_add)]
+    _relax_plan(
+        subset_plan,
+        rng,
+        calc,
+        e0s_ev,
+        records,
+        out_path,
+        n_prior_done=n_plan_done,
+        source_run=f"{SOURCE_RUN}-extend",
+    )
+    added = len(records) - base_count
+    print(f"wrote {len(records)} arrangements ({added} new) -> {out_path}")
 
 
 def main() -> None:
@@ -404,7 +756,65 @@ def main() -> None:
         help="Skip relaxations already present in --out, replaying the same RNG "
         "stream so the remaining draws match a from-scratch run.",
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Check composition-reference coverage (rank, per-element ranges, "
+        "out-of-span norms) for this plan and exit, without running any "
+        "relaxations or needing a GPU (IMPROVEMENTS.md P8/P1).",
+    )
+    parser.add_argument(
+        "--extend",
+        type=Path,
+        default=None,
+        metavar="EXPORT",
+        help="Append new training compositions to an existing export instead of "
+        "generating from scratch. Reuses all of EXPORT's arrangements, E0s, and "
+        "reference split; only --n-add new training compositions are relaxed. "
+        "Writes to --out (may equal EXPORT). See --n-add.",
+    )
+    parser.add_argument(
+        "--n-add",
+        type=int,
+        default=None,
+        help="With --extend: number of new training compositions to append. "
+        "Defaults to the number of training compositions already in the export "
+        "(i.e. doubling the training pool).",
+    )
     args = parser.parse_args()
+
+    if args.preflight:
+        preflight(
+            n_train=args.n_train,
+            train_per_level=args.train_per_level,
+            n_reference=args.n_reference,
+            reference_per_level=args.reference_per_level,
+            seed=args.seed,
+        )
+        return
+
+    if args.extend is not None:
+        n_add = args.n_add
+        if n_add is None:
+            base = json.loads(args.extend.read_text())
+            n_train_existing = len(
+                {
+                    r["composition"]
+                    for r in base["arrangements"]
+                    if r["subset"] == "train"
+                }
+            )
+            n_add = n_train_existing
+            print(f"--n-add not given; doubling the {n_train_existing} training comps")
+        extend(
+            in_path=args.extend,
+            out_path=args.out,
+            n_add=n_add,
+            train_per_level=args.train_per_level,
+            seed=args.seed,
+            resume=args.resume,
+        )
+        return
 
     generate(
         n_train=args.n_train,

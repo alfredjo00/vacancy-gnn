@@ -43,20 +43,20 @@ def test_splits_into_train_and_reference(tmp_path: Path) -> None:
     ]
     path = _write(tmp_path, records)
 
-    train, reference = load_factory_export(path)
+    export = load_factory_export(path)
 
-    assert len(train) == 2
-    assert len(reference) == 1
-    assert train.compositions() == ["A"]
-    assert reference.compositions() == ["B"]
+    assert len(export.train) == 2
+    assert len(export.reference) == 1
+    assert export.train.compositions() == ["A"]
+    assert export.reference.compositions() == ["B"]
 
 
 def test_arrangement_fields_round_trip(tmp_path: Path) -> None:
     path = _write(tmp_path, [_record("A", "train", v=1)])
 
-    train, _reference = load_factory_export(path)
+    export = load_factory_export(path)
 
-    arrangement = train.arrangements[0]
+    arrangement = export.train.arrangements[0]
     assert arrangement.composition == "A"
     assert arrangement.v == 1
     assert arrangement.vacancy_sites == [0]
@@ -99,8 +99,32 @@ def test_invalid_arrangement_raises_validation_error(tmp_path: Path) -> None:
 def test_committed_sample_loads() -> None:
     path = Path(__file__).parent.parent / "data" / "sample" / "factory_sample.json"
 
-    train, reference = load_factory_export(path)
+    export = load_factory_export(path)
 
-    assert len(train) > 0
-    assert len(reference) > 0
-    assert train.compositions() != reference.compositions()
+    assert len(export.train) > 0
+    assert len(export.reference) > 0
+    assert export.train.compositions() != export.reference.compositions()
+
+
+def test_missing_e0s_ev_is_none(tmp_path: Path) -> None:
+    path = _write(tmp_path, [_record("A", "train")])
+
+    export = load_factory_export(path)
+
+    assert export.e0s_ev is None
+
+
+def test_e0s_ev_is_surfaced(tmp_path: Path) -> None:
+    path = tmp_path / "factory.json"
+    path.write_text(
+        json.dumps(
+            {
+                "arrangements": [_record("A", "train")],
+                "e0s_ev": {"O": -1.0, "Fe": -3.0},
+            }
+        )
+    )
+
+    export = load_factory_export(path)
+
+    assert export.e0s_ev == {"O": -1.0, "Fe": -3.0}

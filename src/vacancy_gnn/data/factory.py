@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from pydantic import TypeAdapter
 
@@ -27,20 +27,36 @@ class FactoryLoadError(ValueError):
     """Raised when a factory export is missing required structure."""
 
 
-def load_factory_export(path: str | Path) -> tuple[Dataset, Dataset]:
+class FactoryExport(NamedTuple):
+    """The two datasets and run metadata read from a factory export."""
+
+    train: Dataset
+    reference: Dataset
+    #: Isolated-atom reference energies (eV) per element symbol, keyed by
+    #: symbol (e.g. ``"O"``, ``"Fe"``), as computed by
+    #: :func:`scripts.generate_factory_data.compute_e0s_ev`. ``None`` for
+    #: exports written before this field existed (e.g. the original
+    #: ``factory_v2.json``); consumers should fall back to an unanchored
+    #: :meth:`~vacancy_gnn.models.reference.CompositionReference.fit`.
+    e0s_ev: dict[str, float] | None
+
+
+def load_factory_export(path: str | Path) -> FactoryExport:
     """Load a factory JSON export and split it into (train, reference) datasets.
 
     Args:
         path: Path to a JSON file with the ``{"arrangements": [...]}`` shape
             written by :mod:`scripts.generate_factory_data`. Each record must
             carry every :class:`Arrangement` field plus a ``subset`` field set
-            to ``"train"`` or ``"reference"``.
+            to ``"train"`` or ``"reference"``. May also carry a top-level
+            ``e0s_ev`` mapping.
 
     Returns:
-        A ``(train, reference)`` pair of validated :class:`Dataset`\\ s. The
-        reference dataset holds the densely sampled compositions meant for the
-        brute-force ``G(v)`` evaluation harness (PLAN.md Section 7); the train
-        dataset holds the broad, shallow pool for fitting models.
+        A :class:`FactoryExport` with validated ``train``/``reference``
+        :class:`Dataset`\\ s. The reference dataset holds the densely sampled
+        compositions meant for the brute-force ``G(v)`` evaluation harness
+        (PLAN.md Section 7); the train dataset holds the broad, shallow pool
+        for fitting models.
 
     Raises:
         FactoryLoadError: If the file does not have the expected top-level
@@ -67,4 +83,9 @@ def load_factory_export(path: str | Path) -> tuple[Dataset, Dataset]:
         arrangement = Arrangement.model_validate(record)
         (train if subset == "train" else reference).append(arrangement)
 
-    return Dataset(arrangements=train), Dataset(arrangements=reference)
+    e0s_ev = payload.get("e0s_ev")
+    return FactoryExport(
+        train=Dataset(arrangements=train),
+        reference=Dataset(arrangements=reference),
+        e0s_ev=e0s_ev,
+    )

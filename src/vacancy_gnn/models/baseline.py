@@ -29,10 +29,21 @@ from vacancy_gnn.models.reference import CompositionReference
 class LinearBaseline:
     """Ridge-regression energy model over invariant descriptors."""
 
-    def __init__(self, regularization: float = 1e-3) -> None:
+    def __init__(
+        self,
+        regularization: float = 1e-3,
+        reference_prior: NDArray[np.float64] | None = None,
+        reference_shrinkage: float = 0.0,
+    ) -> None:
         if regularization < 0:
             raise ValueError("regularization must be >= 0")
         self.regularization = regularization
+        #: Optional composition-reference anchor and shrinkage strength (see
+        #: :meth:`vacancy_gnn.models.reference.CompositionReference.fit` and
+        #: IMPROVEMENTS.md P8); ``reference_shrinkage=0.0`` (the default)
+        #: reproduces the plain unconstrained reference fit.
+        self.reference_prior = reference_prior
+        self.reference_shrinkage = reference_shrinkage
         self._weights: NDArray[np.float64] | None = None
         self._intercept: float = 0.0
         self._feature_mean: NDArray[np.float64] | None = None
@@ -52,7 +63,12 @@ class LinearBaseline:
             raise ValueError("number of energies must match number of graphs")
 
         self._reference = CompositionReference()
-        self._reference.fit(graphs, y)
+        self._reference.fit(
+            graphs,
+            y,
+            prior=self.reference_prior,
+            shrinkage=self.reference_shrinkage,
+        )
         residual = y - self._reference.predict(graphs)
 
         mean = x.mean(axis=0)
