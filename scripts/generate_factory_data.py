@@ -14,11 +14,10 @@ higher-ranked models such as eSEN-30M-OAM, which require accepting a Hugging
 Face license). Relaxation is BFGS on cell + ions to fmax=0.05 eV/A (see
 RELAX_FMAX).
 
-Scope: a 3x2x1 supercell of the MgAl2O4 spinel prototype
-(prototypes.db, from Materials Project
-mp-3536), 84 atoms (12 A-site, 24 B-site, 48 O). Each composition fixes a random
-stoichiometry of 4-9 unique cation elements (drawn from the A-site/B-site element pools
-defined below); each
+Scope: a 3x2x1 supercell of the MgAl2O4 spinel prototype (Materials Project
+mp-3536, supplied as an ASE database via --prototype-db), 84 atoms (12 A-site,
+24 B-site, 48 O). Each composition fixes a random stoichiometry of 4-9 unique
+cation elements (drawn from the A-site/B-site element pools below); each
 arrangement within that composition then independently shuffles the site
 occupancy (SQS-style) and draws a random vacancy set, so arrangements vary in
 both cation ordering and vacancy placement.
@@ -69,7 +68,9 @@ from pathlib import Path
 
 import numpy as np
 
-PROTOTYPE_DB = Path("prototypes.db")
+#: ASE database holding the MgAl2O4 spinel prototype (Materials Project
+#: mp-3536). Not shipped with this repo; pass one with --prototype-db.
+DEFAULT_PROTOTYPE_DB = Path("prototypes.db")
 SUPERCELL_DIMENSIONS: tuple[int, int, int] = (3, 2, 1)
 VACANCY_LEVELS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
 #: Number of unique cation elements (summed over both sites) per composition,
@@ -79,9 +80,8 @@ VACANCY_LEVELS: tuple[int, ...] = (0, 1, 2, 3, 4, 5, 6, 7)
 MIN_UNIQUE_ELEMENTS = 4
 MAX_UNIQUE_ELEMENTS = 9
 
-# Real species only: this script assigns species directly
-# minus proxy elements (this script assigns real species directly and does not
-# use icet/SQS, so no proxy juggling is needed).
+# Real species only: this script assigns species directly and does not use
+# icet/SQS, so no proxy elements are needed.
 A_SITE_ELEMENTS: tuple[str, ...] = (
     "Mg",
     "Zn",
@@ -167,7 +167,9 @@ def _pick_element_subset(rng: np.random.Generator) -> tuple[list[str], list[str]
             return a_pool, b_pool
 
 
-def build_composition(rng: np.random.Generator, index: int) -> CompositionSpec:
+def build_composition(
+    rng: np.random.Generator, index: int, prototype_db: Path
+) -> CompositionSpec:
     """Fix one random stoichiometry on the 3x2x1 spinel supercell's cation sites.
 
     Restricted to MIN_UNIQUE_ELEMENTS-MAX_UNIQUE_ELEMENTS unique cation
@@ -179,7 +181,7 @@ def build_composition(rng: np.random.Generator, index: int) -> CompositionSpec:
     import ase.db
     from ase.data import atomic_numbers
 
-    db = ase.db.connect(str(PROTOTYPE_DB))
+    db = ase.db.connect(str(prototype_db))
     row = next(iter(db.select(limit=1)))
     prototype = row.toatoms()
     supercell = prototype.repeat(SUPERCELL_DIMENSIONS)
@@ -398,6 +400,7 @@ def _replay_plan_specs(
     n_reference: int,
     reference_per_level: int,
     seed: int,
+    prototype_db: Path,
 ) -> list[CompositionSpec]:
     """The exact composition specs a :func:`generate` run with these args builds.
 
@@ -412,7 +415,7 @@ def _replay_plan_specs(
     plan = _composition_plan(n_train, train_per_level, n_reference, reference_per_level)
     specs: list[CompositionSpec] = []
     for c, per_level in plan:
-        spec = build_composition(rng, c)
+        spec = build_composition(rng, c, prototype_db)
         specs.append(spec)
         n_oxygen_sites = len(spec.oxygen_positions)
         for v in VACANCY_LEVELS:
@@ -428,6 +431,7 @@ def preflight(
     n_reference: int,
     reference_per_level: int,
     seed: int,
+    prototype_db: Path,
 ) -> None:
     """Check composition-reference coverage before spending any GPU time.
 
@@ -451,7 +455,7 @@ def preflight(
     check before burning GPU-hours on the full factory.
     """
     specs = _replay_plan_specs(
-        n_train, train_per_level, n_reference, reference_per_level, seed
+        n_train, train_per_level, n_reference, reference_per_level, seed, prototype_db
     )
     train_counts = np.stack(
         [_cation_count_vector(s.cation_counts) for s in specs[:n_train]]
@@ -505,6 +509,7 @@ def _relax_plan(
     *,
     n_prior_done: int,
     source_run: str,
+    prototype_db: Path,
 ) -> None:
     """Relax every arrangement in ``plan``, appending records and checkpointing.
 
@@ -529,7 +534,7 @@ def _relax_plan(
     n_done = 0
 
     for c, per_level, subset in plan:
-        spec = build_composition(rng, c)
+        spec = build_composition(rng, c, prototype_db)
         if n_oxygen_sites is None:
             n_oxygen_sites = len(spec.oxygen_positions)
 
@@ -600,6 +605,7 @@ def generate(
     seed: int,
     out_path: Path,
     resume: bool,
+    prototype_db: Path,
 ) -> None:
     rng = np.random.default_rng(seed)
 
@@ -629,6 +635,7 @@ def generate(
         out_path,
         n_prior_done=n_prior_done,
         source_run=SOURCE_RUN,
+        prototype_db=prototype_db,
     )
     print(f"wrote {len(records)} arrangements -> {out_path}")
 
@@ -651,6 +658,7 @@ def extend(
     train_per_level: int,
     seed: int,
     resume: bool,
+    prototype_db: Path,
 ) -> None:
     """Append ``n_add`` new training compositions to an existing export.
 
@@ -717,6 +725,7 @@ def extend(
         out_path,
         n_prior_done=n_plan_done,
         source_run=f"{SOURCE_RUN}-extend",
+        prototype_db=prototype_db,
     )
     added = len(records) - base_count
     print(f"wrote {len(records)} arrangements ({added} new) -> {out_path}")
@@ -781,7 +790,21 @@ def main() -> None:
         "Defaults to the number of training compositions already in the export "
         "(i.e. doubling the training pool).",
     )
+    parser.add_argument(
+        "--prototype-db",
+        type=Path,
+        default=DEFAULT_PROTOTYPE_DB,
+        help="ASE database holding the MgAl2O4 spinel prototype (Materials "
+        "Project mp-3536). Not shipped with this repo.",
+    )
     args = parser.parse_args()
+
+    if not args.prototype_db.exists():
+        parser.error(
+            f"prototype database not found: {args.prototype_db}\n"
+            "Pass one with --prototype-db (Materials Project mp-3536, as an "
+            "ASE .db)."
+        )
 
     if args.preflight:
         preflight(
@@ -790,6 +813,7 @@ def main() -> None:
             n_reference=args.n_reference,
             reference_per_level=args.reference_per_level,
             seed=args.seed,
+            prototype_db=args.prototype_db,
         )
         return
 
@@ -813,6 +837,7 @@ def main() -> None:
             train_per_level=args.train_per_level,
             seed=args.seed,
             resume=args.resume,
+            prototype_db=args.prototype_db,
         )
         return
 
@@ -824,6 +849,7 @@ def main() -> None:
         seed=args.seed,
         out_path=args.out,
         resume=args.resume,
+        prototype_db=args.prototype_db,
     )
 
 
