@@ -36,7 +36,6 @@ into the sum is free instead of one more relaxation.
 > Why the average and not just the lowest-energy arrangement? The minimum is the
 > `T -> 0` limit of the expression above; at reactor temperatures (1223-1323 K) the
 > configurational entropy is not negligible and taking the minimum biases rankings.
-> See [`PLAN.md`](PLAN.md) Section 2.1.
 
 ![Noisy single-SQS G(v) vs. the learned Boltzmann average](notebooks/money_figure.png)
 
@@ -79,7 +78,7 @@ Reported honestly rather than tuned away:
 
 ## Status
 
-Steps 1-7 of the [`PLAN.md`](PLAN.md) build order are done: the thermodynamics
+Done so far: the thermodynamics
 core, data layer, linear baseline, the dependency-light E(3)-equivariant GNN
 (PaiNN-style, no e3nn/torch_geometric), the evaluation harness (brute-force
 reference, parity, oracle-efficiency, min-vs-average, T-sweeps), and the
