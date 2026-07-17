@@ -2,21 +2,9 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-.eggs/
 build/
 dist/
-
-# Tooling caches
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Environments
-.venv/
 venv/
-.env
 
 # ML artifacts
 wandb/
@@ -31,14 +19,15 @@ data/full/
 *.db
 !data/sample/**
 
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
+# Hidden files: tool caches, editor state, local config. Only the few
+# tracked ones are allowed back in.
+.*
+!/.github/
+!/.gitignore
+!/.pre-commit-config.yaml
 
-# Local tooling / notes (personal, not for the public repo)
-.claude/settings.local.json
-.claude/
-CLAUDE.md
-PLAN.md
+# Root-level documents are local notes; the README is the public one.
+/*.md
+!/README.md
+
 logs/
