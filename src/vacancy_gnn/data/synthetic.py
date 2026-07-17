@@ -9,6 +9,7 @@ function of the descriptor plus noise, so a fitted model can actually learn sign
 from __future__ import annotations
 
 import numpy as np
+from numpy.typing import NDArray
 
 from vacancy_gnn.data.descriptors import descriptor_length, graph_descriptor
 from vacancy_gnn.data.featurize import build_graph
@@ -27,7 +28,7 @@ def _oxygen_sublattice(rng: np.random.Generator, n_sites: int) -> list[list[floa
     return sites
 
 
-def _reference_weight(weight_seed: int) -> np.ndarray:
+def _reference_weight(weight_seed: int) -> NDArray[np.float64]:
     """The fixed random linear response over the descriptor that defines labels.
 
     Shared by :func:`make_synthetic_dataset` and :func:`make_brute_force_reference`

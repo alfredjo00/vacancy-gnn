@@ -183,7 +183,7 @@ class CompositionReference:
             x_aug = np.vstack([x, lam_sqrt * np.eye(n_species)])
             y_aug = np.concatenate([y, lam_sqrt * np.asarray(prior, dtype=np.float64)])
             coeffs, *_ = np.linalg.lstsq(x_aug, y_aug, rcond=None)
-        self._coeffs = coeffs
+        self._coeffs = np.asarray(coeffs, dtype=np.float64)
 
     def predict(self, graphs: list[Graph]) -> NDArray[np.float64]:
         """Reference energy per graph."""

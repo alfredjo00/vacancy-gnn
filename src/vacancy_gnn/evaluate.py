@@ -459,7 +459,9 @@ def evaluate(
         An :class:`EvaluationReport` bundling every metric in PLAN.md Section 7.
     """
     if sweep_temperatures is None:
-        sweep_temperatures = np.linspace(0.0, 2.0 * reactor_temperature, 50)
+        sweep_temperatures = np.linspace(0.0, 2.0 * reactor_temperature, 50).astype(
+            np.float64
+        )
 
     return EvaluationReport(
         parity=per_arrangement_parity(model, reference, cutoff=cutoff),

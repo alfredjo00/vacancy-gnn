@@ -70,7 +70,7 @@ files = ["src"]
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["torch.*", "pandas.*", "matplotlib.*", "pyarrow.*"]
+module = ["torch.*"]
 ignore_missing_imports = true
 
 # egnn.py subclasses torch.nn.Module. When torch is not installed (the core CI

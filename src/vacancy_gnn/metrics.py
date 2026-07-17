@@ -82,7 +82,7 @@ def free_energy_convergence(
     return sizes, estimates
 
 
-def _check(yt: np.ndarray, yp: np.ndarray) -> None:
+def _check(yt: NDArray[np.float64], yp: NDArray[np.float64]) -> None:
     if yt.size == 0:
         raise ValueError("metrics require at least one sample")
     if yt.shape != yp.shape:
